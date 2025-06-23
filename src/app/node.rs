@@ -4,10 +4,10 @@ use reth::payload::{PayloadBuilderHandle, PayloadServiceCommand};
 use reth::transaction_pool::TransactionPool;
 use reth_chainspec::ChainSpec;
 use reth_node_builder::components::{BasicPayloadServiceBuilder, PayloadServiceBuilder};
-use reth_node_builder::{BuilderContext, ConfigureEvm};
 use reth_node_builder::{
-    FullNodeTypes, Node, NodeComponentsBuilder, NodeTypes, components::ComponentsBuilder,
+    components::ComponentsBuilder, FullNodeTypes, Node, NodeComponentsBuilder, NodeTypes,
 };
+use reth_node_builder::{BuilderContext, ConfigureEvm};
 use reth_node_ethereum::node::{EthereumAddOns, EthereumNetworkBuilder, EthereumPoolBuilder};
 use reth_trie_db::MerklePatriciaTrie;
 use tokio::sync::{broadcast, mpsc};

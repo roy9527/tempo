@@ -1,15 +1,15 @@
+use crate::app::state::{decode_value, encode_value, reload_log_level, State};
 use crate::context::MalachiteContext;
 use crate::height::Height;
-use crate::app::state::{State, reload_log_level, decode_value, encode_value};
 use eyre::eyre;
-use malachitebft_app_channel::{AppMsg, Channels, ConsensusMsg, NetworkMsg};
 use malachitebft_app_channel::app::streaming::StreamContent;
-use malachitebft_app_channel::app::types::{ProposedValue, LocallyProposedValue};
 use malachitebft_app_channel::app::types::sync::RawDecidedValue;
-use malachitebft_core_types::{Round, Validity, Height as HeightTrait, Value as ValueTrait};
+use malachitebft_app_channel::app::types::{LocallyProposedValue, ProposedValue};
+use malachitebft_app_channel::{AppMsg, Channels, ConsensusMsg, NetworkMsg};
+use malachitebft_core_types::{Height as HeightTrait, Round, Validity, Value as ValueTrait};
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{info, error};
+use tracing::{error, info};
 
 pub async fn run(state: &mut State, channels: &mut Channels<MalachiteContext>) -> eyre::Result<()> {
     while let Some(msg) = channels.consensus.recv().await {

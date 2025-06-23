@@ -1,3 +1,57 @@
+//! # Reth-Malachite
+//!
+//! A blockchain node implementation that combines Reth's execution layer with Malachite's
+//! Byzantine Fault Tolerant (BFT) consensus engine.
+//!
+//! ## Architecture
+//!
+//! This crate follows the Tendermint architecture pattern with a clear separation between:
+//!
+//! ### Consensus Layer (Malachite)
+//! - Handles validator coordination and block agreement
+//! - Implements the BFT consensus protocol
+//! - Manages consensus-specific P2P networking
+//! - Located in the `consensus` module
+//!
+//! ### Application Layer (Reth)
+//! - Executes transactions using the EVM
+//! - Manages blockchain state and storage
+//! - Builds blocks when requested by consensus
+//! - Located in the `app` module
+//!
+//! ## Communication Model
+//!
+//! The consensus and application layers communicate through channels:
+//! ```text
+//! Consensus Engine                    Application (Reth)
+//!       |                                    |
+//!       |---- GetValue Request ------------->|
+//!       |<--- Proposed Block ----------------|
+//!       |                                    |
+//!       |---- ReceivedProposalPart -------->|
+//!       |<--- Processed Proposal ------------|
+//!       |                                    |
+//!       |---- Decided (commit) ------------>|
+//!       |<--- Start Next Height -------------|
+//! ```
+//!
+//! ## Key Modules
+//!
+//! - **`app`**: The application layer that interfaces with Reth's execution engine
+//! - **`consensus`**: Infrastructure for running the Malachite consensus engine
+//! - **`context`**: Type definitions that bridge Malachite and Reth types
+//! - **`block`**: Block-related types and utilities
+//! - **`provider`**: Cryptographic providers for signing and verification
+//! - **`cli`**: Command-line interface and chain specification
+//! - **`consensus_utils`**: Utilities for consensus integration with Reth's node builder
+//!
+//! ## Usage
+//!
+//! The main entry point is `bin/reth-malachite.rs` which:
+//! 1. Initializes the Reth node infrastructure
+//! 2. Starts the Malachite consensus engine
+//! 3. Connects them through the channel-based communication layer
+
 pub mod app;
 pub mod block;
 pub mod cli;

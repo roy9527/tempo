@@ -1,5 +1,3 @@
-use bytes::Bytes;
-use eyre::Result;
 use crate::context::{
     BasePeerAddress, BasePeerSet, BaseProposalPart, BaseValue, MalachiteContext, ValueIdWrapper,
 };
@@ -7,13 +5,15 @@ use crate::height::Height;
 use crate::provider::Ed25519Provider;
 use crate::types::Address;
 use crate::utils::seed_from_address;
+use bytes::Bytes;
+use eyre::Result;
 use malachitebft_app_channel::app::streaming::StreamMessage;
 use malachitebft_app_channel::app::types::{
     LocallyProposedValue, PeerId as MalachitePeerId, ProposedValue,
 };
 use malachitebft_core_types::{CommitCertificate, Height as HeightTrait, Round, VoteExtensions};
-use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rand::SeedableRng;
 use reth::payload::PayloadBuilderHandle;
 use reth_ethereum_engine_primitives::EthPayloadTypes;
 use serde::{Deserialize, Serialize};
@@ -422,4 +422,3 @@ pub fn decode_value(_bytes: Bytes) -> Option<BaseValue> {
 
 // Type alias for compatibility
 pub type ValueId = ValueIdWrapper;
-

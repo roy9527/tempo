@@ -1,10 +1,10 @@
 use clap::{Args, Parser};
+use reth::builder::NodeHandle;
 use reth_malachite::app::node::MalachiteNode;
 use reth_malachite::app::{Config, Genesis, State};
 use reth_malachite::cli::{Cli, MalachiteChainSpecParser};
 use reth_malachite::context::MalachiteContext;
 use reth_malachite::types::Address;
-use reth::builder::NodeHandle;
 
 /// No Additional arguments
 #[derive(Debug, Clone, Copy, Default, Args)]
