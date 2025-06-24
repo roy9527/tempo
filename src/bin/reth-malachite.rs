@@ -5,8 +5,10 @@ use reth_malachite::app::{Config, Genesis, State, ValidatorInfo};
 use reth_malachite::cli::{Cli, MalachiteChainSpecParser};
 use reth_malachite::consensus::{start_consensus_engine, EngineConfig};
 use reth_malachite::context::MalachiteContext;
+use reth_malachite::store::Store;
 use reth_malachite::types::Address;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// No Additional arguments
 #[derive(Debug, Clone, Copy, Default, Args)]
@@ -43,8 +45,19 @@ fn main() -> eyre::Result<()> {
             // Get the beacon engine handle
             let app_handle = node.add_ons_handle.beacon_engine_handle.clone();
 
-            // Now create the application state with the engine handle
-            let state = State::new(ctx.clone(), config, genesis.clone(), address, app_handle);
+            // Get the provider from the node to create the store
+            let provider = node.provider.clone();
+            let store = Store::new(Arc::new(provider));
+
+            // Now create the application state with the engine handle and store
+            let state = State::new(
+                ctx.clone(),
+                config,
+                genesis.clone(),
+                address,
+                store,
+                app_handle,
+            );
 
             // Get the home directory
             let home_dir = PathBuf::from("./data"); // In production, use proper data dir
