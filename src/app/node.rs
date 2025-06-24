@@ -7,7 +7,10 @@ use reth_node_builder::{
     components::ComponentsBuilder, FullNodeTypes, Node, NodeComponentsBuilder, NodeTypes,
 };
 use reth_node_builder::{BuilderContext, ConfigureEvm};
-use reth_node_ethereum::node::{EthereumAddOns, EthereumNetworkBuilder, EthereumPoolBuilder, EthereumEthApiBuilder, EthereumEngineValidatorBuilder};
+use reth_node_ethereum::node::{
+    EthereumAddOns, EthereumEngineValidatorBuilder, EthereumEthApiBuilder, EthereumNetworkBuilder,
+    EthereumPoolBuilder,
+};
 use reth_trie_db::MerklePatriciaTrie;
 use tokio::sync::{broadcast, mpsc};
 use tracing::warn;
