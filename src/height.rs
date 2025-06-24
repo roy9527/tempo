@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// A blockchain height
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
-pub struct Height(u64);
+pub struct Height(pub u64);
 
 impl MalachiteHeight for Height {
     const ZERO: Self = Height(0);
