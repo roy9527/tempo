@@ -42,10 +42,8 @@ pub struct ProposalKey {
 
 impl ProposalKey {
     pub fn new(height: Height, round: Round, value_id: &crate::ValueId) -> Self {
-        let mut value_id_hash = [0u8; 32];
-        // Convert the u64 value ID to bytes for the hash
-        let id_bytes = value_id.as_u64().to_be_bytes();
-        value_id_hash[..8].copy_from_slice(&id_bytes);
+        // Copy the B256 hash directly
+        let value_id_hash = value_id.as_b256().0;
 
         Self {
             height: height.0,
@@ -176,8 +174,8 @@ impl Compress for DecidedValue {
         // Encode value and certificate separately
         let mut data = Vec::new();
 
-        // Encode value
-        let value_bytes = self.value.extensions.to_vec();
+        // Encode value (serialize the block)
+        let value_bytes = crate::app::encode_value(&self.value).to_vec();
         let value_len = value_bytes.len() as u32;
         data.extend_from_slice(&value_len.to_le_bytes());
         data.extend_from_slice(&value_bytes);
@@ -238,10 +236,11 @@ impl Decompress for DecidedValue {
         let certificate =
             decode_commit_certificate(cert_proto).map_err(|_| DatabaseError::Decode)?;
 
-        Ok(DecidedValue {
-            value: Value::new(bytes::Bytes::from(value_data)),
-            certificate,
-        })
+        // Decode value from bytes
+        let value = crate::app::decode_value(bytes::Bytes::from(value_data))
+            .ok_or(DatabaseError::Decode)?;
+
+        Ok(DecidedValue { value, certificate })
     }
 }
 
