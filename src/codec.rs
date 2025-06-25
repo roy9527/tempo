@@ -59,12 +59,17 @@ impl Codec<Value> for ProtoCodec {
 
     fn decode(&self, bytes: Bytes) -> Result<Value, Self::Error> {
         let proto = proto::Value::decode(bytes.as_ref())?;
-        Ok(Value::new(proto.value.unwrap_or_default()))
+        // Decode the block from the proto value field
+        let value_bytes = proto.value.unwrap_or_default();
+        crate::app::decode_value(value_bytes)
+            .ok_or_else(|| ProtoError::Other("Failed to decode block".to_string()))
     }
 
     fn encode(&self, msg: &Value) -> Result<Bytes, Self::Error> {
+        // Encode the block to bytes
+        let value_bytes = crate::app::encode_value(msg);
         let proto = proto::Value {
-            value: Some(msg.extensions.clone()),
+            value: Some(value_bytes),
         };
         Ok(Bytes::from(proto.encode_to_vec()))
     }
@@ -219,9 +224,13 @@ pub fn decode_commit_certificate(
     Ok(CommitCertificate {
         height: Height(proto.height),
         round: Round::new(proto.round),
-        value_id: ValueId::new(u64::from_be_bytes(
-            value_id_bytes[..8].try_into().unwrap_or([0u8; 8]),
-        )),
+        value_id: {
+            // Convert bytes to B256
+            let mut hash_bytes = [0u8; 32];
+            let len = value_id_bytes.len().min(32);
+            hash_bytes[..len].copy_from_slice(&value_id_bytes[..len]);
+            ValueId::new(alloy_primitives::B256::from(hash_bytes))
+        },
         commit_signatures: proto
             .signatures
             .into_iter()
@@ -279,7 +288,7 @@ fn encode_proposed_value(
             value: Bytes::from(proposed_value.proposer.0.as_bytes().to_vec()),
         }),
         value: Some(proto::Value {
-            value: Some(proposed_value.value.extensions.clone()),
+            value: Some(crate::app::encode_value(&proposed_value.value)),
         }),
         validity: proposed_value.validity.to_bool(),
     })
@@ -316,7 +325,8 @@ fn decode_proposed_value(
                 ));
             }
         },
-        value: Value::new(value_data),
+        value: crate::app::decode_value(value_data)
+            .ok_or_else(|| ProtoError::Other("Failed to decode block value".to_string()))?,
         validity: Validity::from_bool(proto.validity),
     })
 }
