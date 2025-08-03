@@ -1,39 +1,73 @@
-[package]
-name = "reth-malachite"
+[workspace.package]
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.86"
+edition = "2024"
+rust-version = "1.88"
 
-[lib]
-name = "reth_malachite"
-path = "src/lib.rs"
+[workspace]
+members = [
+  "bin/tempo",
+  "crates/consensus"
+]
 
-[[bin]]
-name = "reth-malachite"
-path = "src/bin/reth-malachite.rs"
+# Resolver 3 is available with edition 2024
+resolver = "3"
 
-[dependencies]
-# Core dependencies
-anyhow = "1.0.98"
-async-trait = "0.1"
-base64 = "0.22"
-bincode = "1.3"
-bytes = "1.8"
-clap = { version = "4.5", features = ["derive"] }
-eyre = "0.6.12"
-hex = "0.4"
-multiaddr = "0.18"
-rand = "0.8.5"
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.140"
-sha3 = "0.10"
-tempfile = "3.20.0"
-thiserror = "2.0"
-tokio = { version = "1.45.1", features = ["full"] }
-toml = "0.8"
-tracing = "0.1"
+# [workspace.lints]
+# rust.missing_debug_implementations = "warn"
+# rust.missing_docs = "warn"
+# rust.rust_2018_idioms = { level = "warn", priority = -1 }
+# rust.unreachable_pub = "warn"
+# rust.unused_must_use = "warn"
+# rustdoc.all = "warn"
+# # rust.unnameable-types = "warn"
 
-# Reth dependencies
+# Speed up compilation time for dev builds by reducing emitted debug info.
+# NOTE: Debuggers may provide less useful information with this setting.
+# Uncomment this section if you're using a debugger.
+[profile.dev]
+# https://davidlattimore.github.io/posts/2024/02/04/speeding-up-the-rust-edit-build-run-cycle.html
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+# Speed up tests.
+[profile.dev.package]
+proptest.opt-level = 3
+rand_chacha.opt-level = 3
+rand_xorshift.opt-level = 3
+unarray.opt-level = 3
+
+# Meant for testing - all optimizations, but with debug assertions and overflow checks.
+[profile.hivetests]
+inherits = "test"
+opt-level = 3
+lto = "thin"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+debug = "none"
+strip = "symbols"
+panic = "unwind"
+codegen-units = 16
+
+# Use the `--profile profiling` flag to show symbols in release mode.
+# e.g. `cargo build --profile profiling`
+[profile.profiling]
+inherits = "release"
+debug = "full"
+strip = "none"
+
+# Include debug info in benchmarks too.
+[profile.bench]
+inherits = "profiling"
+
+[profile.maxperf]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
+[workspace.dependencies]
+tempo-consensus = { path = "crates/consensus" }
 reth = { git = "https://github.com/paradigmxyz/reth", branch = "main", package = "reth" }
 reth-chainspec = { git = "https://github.com/paradigmxyz/reth", branch = "main", package = "reth-chainspec" }
 reth-cli = { git = "https://github.com/paradigmxyz/reth", branch = "main", package = "reth-cli" }
@@ -61,8 +95,6 @@ reth-storage-api = { git = "https://github.com/paradigmxyz/reth", branch = "main
 reth-tasks = { git = "https://github.com/paradigmxyz/reth", branch = "main", package = "reth-tasks" }
 reth-tracing = { git = "https://github.com/paradigmxyz/reth", branch = "main", package = "reth-tracing" }
 reth-trie-db = { git = "https://github.com/paradigmxyz/reth", branch = "main", package = "reth-trie-db" }
-
-# Alloy dependencies
 alloy = { version = "1.0.12", default-features = false }
 alloy-consensus = { version = "1.0.12", features = ["serde-bincode-compat"] }
 alloy-eips = { version = "1.0.12", features = ["serde"] }
@@ -70,8 +102,6 @@ alloy-genesis = "1.0.12"
 alloy-primitives = "1.2.0"
 alloy-rpc-types-engine = "1.0.12"
 alloy-trie = "0.9.0"
-
-# Malachite dependencies
 malachitebft-app = { git = "https://github.com/informalsystems/malachite", branch = "no-dns", package = "informalsystems-malachitebft-app" }
 malachitebft-app-channel = { git = "https://github.com/informalsystems/malachite", branch = "no-dns", package = "informalsystems-malachitebft-app-channel" }
 malachitebft-codec = { git = "https://github.com/informalsystems/malachite", branch = "no-dns", package = "informalsystems-malachitebft-codec" }
@@ -79,19 +109,33 @@ malachitebft-core-consensus = { git = "https://github.com/informalsystems/malach
 malachitebft-core-types = { git = "https://github.com/informalsystems/malachite", branch = "no-dns", package = "informalsystems-malachitebft-core-types", features = ["serde"] }
 malachitebft-signing-ed25519 = { git = "https://github.com/informalsystems/malachite", branch = "no-dns", package = "informalsystems-malachitebft-signing-ed25519", features = ["serde", "rand"] }
 malachitebft-sync = { git = "https://github.com/informalsystems/malachite", branch = "no-dns", package = "informalsystems-malachitebft-sync" }
-
-# Proto dependencies
-prost = "0.13"
 malachitebft-proto = { git = "https://github.com/informalsystems/malachite", branch = "no-dns", package = "informalsystems-malachitebft-proto" }
-
-[build-dependencies]
+anyhow = "1.0.98"
+async-trait = "0.1"
+base64 = "0.22"
+bincode = "1.3"
+bytes = "1.8"
+clap = { version = "4.5", features = ["derive"] }
+eyre = "0.6.12"
+hex = "0.4"
+multiaddr = "0.18"
+rand = "0.8.5"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sha3 = "0.10"
+tempfile = "3.20.0"
+thiserror = "2.0"
+tokio = { version = "1.45.1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+prost = "0.13"
 prost-build = "0.13"
 protox = "0.7"
 
 [patch.crates-io]
 libp2p-dns = { git = "https://github.com/informalsystems/rust-libp2p.git", branch = "reth" }
 
-# Alloy patches to match reth dependencies
+# alloy patches for reth dependencies
 alloy-consensus = { git = "https://github.com/alloy-rs/alloy", rev = "08fa016ed950b6e65f810fc9cdef7cf38fbc63f6" }
 alloy-eips = { git = "https://github.com/alloy-rs/alloy", rev = "08fa016ed950b6e65f810fc9cdef7cf38fbc63f6" }
 alloy-genesis = { git = "https://github.com/alloy-rs/alloy", rev = "08fa016ed950b6e65f810fc9cdef7cf38fbc63f6" }
