@@ -706,6 +706,12 @@ where
     /// - Time window validation (validAfter/validBefore)
     #[inline]
     fn validate_env(&self, evm: &mut Self::Evm) -> Result<(), Self::Error> {
+        // All accounts have zero balance so transfer of value is not possible.
+        // Check added in https://github.com/tempoxyz/tempo/pull/759
+        if !evm.ctx.tx.value().is_zero() {
+            return Err(TempoInvalidTransaction::ValueTransferNotAllowed.into());
+        }
+
         // First perform standard validation (header + transaction environment)
         // This validates: prevrandao, excess_blob_gas, chain_id, gas limits, tx type support, etc.
         validation::validate_env::<_, Self::Error>(evm.ctx())?;
@@ -779,7 +785,7 @@ where
 /// - Per-call CREATE costs (if applicable):
 ///   - Additional 32k base (CREATE constant)
 ///   - Initcode analysis gas (2 per 32-byte chunk, Shanghai+)
-/// - Per-call value transfer cost (9k if value > 0 and TxKind::Call)
+/// - Check that value transfer is zero.
 /// - Access list costs (shared across batch)
 /// - Floor gas calculation (EIP-7623, Prague+)
 fn calculate_aa_batch_intrinsic_gas<'a>(
@@ -788,7 +794,7 @@ fn calculate_aa_batch_intrinsic_gas<'a>(
     access_list: Option<impl Iterator<Item = &'a AccessListItem>>,
     aa_authorization_list: &[tempo_primitives::transaction::AASignedAuthorization],
     spec: RevmSpecId,
-) -> InitialAndFloorGas {
+) -> Result<InitialAndFloorGas, TempoInvalidTransaction> {
     let mut gas = InitialAndFloorGas::default();
 
     // 1. Base stipend (21k, once per transaction)
@@ -825,7 +831,14 @@ fn calculate_aa_batch_intrinsic_gas<'a>(
             gas.initial_gas += initcode_cost(call.input.len());
         }
 
+        // Note: Transaction value is not allowed in AA transactions as there is no balances in accounts yet.
+        // Check added in https://github.com/tempoxyz/tempo/pull/759
+        if !call.value.is_zero() {
+            return Err(TempoInvalidTransaction::ValueTransferNotAllowedInAATx);
+        }
+
         // 4c. Value transfer cost using revm constant
+        // left here for future reference.
         if !call.value.is_zero() && call.to.is_call() {
             gas.initial_gas += CALLVALUE; // 9000 gas
         }
@@ -849,7 +862,7 @@ fn calculate_aa_batch_intrinsic_gas<'a>(
     // 6. Floor gas  using revm helper
     gas.floor_gas = calc_tx_floor_cost(total_tokens); // tokens * 10 + 21000
 
-    gas
+    Ok(gas)
 }
 
 /// Validates and calculates initial transaction gas for AA transactions.
@@ -896,7 +909,7 @@ where
         tx.access_list(),
         &aa_env.aa_authorization_list,
         spec,
-    );
+    )?;
 
     if evm.ctx.cfg.is_eip7623_disabled() {
         batch_gas.floor_gas = 0u64;
@@ -1243,7 +1256,8 @@ mod tests {
             None::<std::iter::Empty<&AccessListItem>>, // no access list
             &aa_env.aa_authorization_list,
             spec,
-        );
+        )
+        .unwrap();
 
         // Calculate expected gas using revm's function for equivalent normal tx
         let normal_tx_gas = calculate_initial_tx_gas(
@@ -1301,7 +1315,8 @@ mod tests {
             None::<std::iter::Empty<&AccessListItem>>,
             &aa_env.aa_authorization_list,
             spec,
-        );
+        )
+        .unwrap();
 
         // Calculate base gas for a single normal tx
         let base_tx_gas = calculate_initial_tx_gas(spec, &calldata, false, 0, 0, 0);
@@ -1353,7 +1368,8 @@ mod tests {
             None::<std::iter::Empty<&AccessListItem>>,
             &aa_env.aa_authorization_list,
             spec,
-        );
+        )
+        .unwrap();
 
         // Calculate base gas for normal tx
         let base_gas = calculate_initial_tx_gas(spec, &calldata, false, 0, 0, 0);
@@ -1394,7 +1410,8 @@ mod tests {
             None::<std::iter::Empty<&AccessListItem>>,
             &aa_env.aa_authorization_list,
             spec,
-        );
+        )
+        .unwrap();
 
         // Calculate expected using revm's function for CREATE tx
         let base_gas = calculate_initial_tx_gas(
@@ -1411,7 +1428,6 @@ mod tests {
     fn test_aa_gas_value_transfer() {
         use crate::AATxEnv;
         use alloy_primitives::{Bytes, TxKind};
-        use revm::interpreter::gas::calculate_initial_tx_gas;
         use tempo_primitives::transaction::{AASignature, Call};
 
         let spec = RevmSpecId::CANCUN;
@@ -1420,7 +1436,7 @@ mod tests {
         let call = Call {
             to: TxKind::Call(Address::random()),
             value: U256::from(1000), // Non-zero value
-            input: calldata.clone(),
+            input: calldata,
         };
 
         let aa_env = AATxEnv {
@@ -1429,7 +1445,7 @@ mod tests {
             ..Default::default()
         };
 
-        let gas = calculate_aa_batch_intrinsic_gas(
+        let res = calculate_aa_batch_intrinsic_gas(
             &aa_env.aa_calls,
             &aa_env.signature,
             None::<std::iter::Empty<&AccessListItem>>,
@@ -1437,15 +1453,9 @@ mod tests {
             spec,
         );
 
-        // Calculate base gas for normal tx (without value cost in intrinsic)
-        let base_gas = calculate_initial_tx_gas(spec, &calldata, false, 0, 0, 0);
-
-        // Expected: normal tx + CALLVALUE + per-call overhead
-        // Note: intrinsic gas includes CALLVALUE cost
-        let expected = base_gas.initial_gas + CALLVALUE + COLD_ACCOUNT_ACCESS_COST;
         assert_eq!(
-            gas.initial_gas, expected,
-            "Should include value transfer cost"
+            res.unwrap_err(),
+            TempoInvalidTransaction::ValueTransferNotAllowedInAATx
         );
     }
 
@@ -1478,7 +1488,8 @@ mod tests {
             None::<std::iter::Empty<&AccessListItem>>,
             &aa_env.aa_authorization_list,
             spec,
-        );
+        )
+        .unwrap();
 
         // Calculate expected using revm's function
         let base_gas = calculate_initial_tx_gas(spec, &calldata, false, 0, 0, 0);
@@ -1519,7 +1530,8 @@ mod tests {
             None::<std::iter::Empty<&AccessListItem>>,
             &aa_env.aa_authorization_list,
             spec,
-        );
+        )
+        .unwrap();
 
         // Calculate expected floor gas using revm's function
         let base_gas = calculate_initial_tx_gas(spec, &calldata, false, 0, 0, 0);
@@ -1529,5 +1541,34 @@ mod tests {
             gas.floor_gas, base_gas.floor_gas,
             "Should calculate floor gas for Prague matching revm"
         );
+    }
+
+    /// This test will start failing once we get the balance transfer enabled
+    /// PR that introduced [`TempoInvalidTransaction::ValueTransferNotAllowed`] https://github.com/tempoxyz/tempo/pull/759
+    #[test]
+    fn test_zero_value_transfer() -> eyre::Result<()> {
+        use crate::{TempoEvm, evm::TempoContext};
+
+        // Create a test context with a transaction that has a non-zero value
+        let db = CacheDB::new(EmptyDB::default());
+        let ctx = TempoContext::new(db, SpecId::CANCUN);
+        let mut evm = TempoEvm::new(ctx, ());
+
+        // Set a non-zero value on the transaction
+        evm.ctx.tx.inner.value = U256::from(1000);
+
+        // Create the handler
+        let handler = TempoEvmHandler::<_, ()>::new();
+
+        // Call validate_env and expect it to fail with ValueTransferNotAllowed
+        let result = handler.validate_env(&mut evm);
+
+        if let Err(EVMError::Transaction(err)) = result {
+            assert_eq!(err, TempoInvalidTransaction::ValueTransferNotAllowed);
+        } else {
+            panic!("Expected ValueTransferNotAllowed error");
+        }
+
+        Ok(())
     }
 }
