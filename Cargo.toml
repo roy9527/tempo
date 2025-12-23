@@ -26,6 +26,7 @@ members = [
   "crates/precompiles",
   "crates/precompiles-macros",
   "crates/primitives",
+  "crates/storage-interop",
   "crates/contracts",
   "crates/telemetry-util",
   "crates/transaction-pool",
@@ -113,6 +114,7 @@ tempo-precompiles = { path = "crates/precompiles", default-features = false }
 tempo-precompiles-macros = { path = "crates/precompiles-macros" }
 tempo-primitives = { path = "crates/primitives", default-features = false, features = ["reth"] }
 tempo-contracts = { path = "crates/contracts", default-features = false }
+tempo-storage-interop = { path = "crates/storage-interop", default-features = false }
 tempo-telemetry-util = { path = "crates/telemetry-util", default-features = false }
 tempo-transaction-pool = { path = "crates/transaction-pool", default-features = false }
 
