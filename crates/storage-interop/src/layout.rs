@@ -72,6 +72,7 @@ pub trait StorableType {
     const SLOTS: usize = Self::LAYOUT.slots();
     const BYTES: usize = Self::LAYOUT.bytes();
     const IS_PACKABLE: bool = Self::LAYOUT.is_packable();
+    const IS_DYNAMIC: bool = false;
 
     type Handler;
 

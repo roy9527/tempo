@@ -2,7 +2,7 @@ use alloy_primitives::{Address, U256};
 
 use crate::{
     layout::{Layout, Packable, StorableType},
-    storage::Slot,
+    slot::Slot,
     InteropError,
     Result,
 };

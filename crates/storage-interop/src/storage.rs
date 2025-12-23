@@ -1,57 +1,10 @@
-use alloy_primitives::{Address, U256, keccak256};
+use alloy_primitives::{Address, B256, U256, keccak256};
 
-use crate::{layout::LayoutCtx, layout::StorableType, Result};
+use crate::Result;
 
 pub trait StorageOps {
     fn load(&self, slot: U256) -> Result<U256>;
     fn store(&mut self, slot: U256, value: U256) -> Result<()>;
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct Slot<T> {
-    slot: U256,
-    ctx: LayoutCtx,
-    _marker: std::marker::PhantomData<T>,
-}
-
-impl<T: StorableType> Slot<T> {
-    pub fn new(slot: U256) -> Self {
-        Self {
-            slot,
-            ctx: LayoutCtx::FULL,
-            _marker: std::marker::PhantomData,
-        }
-    }
-
-    pub fn new_with_ctx(slot: U256, ctx: LayoutCtx) -> Self {
-        Self {
-            slot,
-            ctx,
-            _marker: std::marker::PhantomData,
-        }
-    }
-
-    pub fn slot(&self) -> U256 {
-        self.slot
-    }
-
-    pub fn ctx(&self) -> LayoutCtx {
-        self.ctx
-    }
-}
-
-impl<T: crate::Storable> crate::Handler<T> for Slot<T> {
-    fn read<S: StorageOps>(&self, storage: &S) -> Result<T> {
-        T::load(storage, self.slot, self.ctx)
-    }
-
-    fn write<S: StorageOps>(&mut self, storage: &mut S, value: T) -> Result<()> {
-        value.store(storage, self.slot, self.ctx)
-    }
-
-    fn delete<S: StorageOps>(&mut self, storage: &mut S) -> Result<()> {
-        T::delete(storage, self.slot, self.ctx)
-    }
 }
 
 pub trait StorageKey {
@@ -71,6 +24,12 @@ pub trait StorageKey {
 }
 
 impl StorageKey for Address {
+    fn as_storage_bytes(&self) -> impl AsRef<[u8]> {
+        self.as_slice()
+    }
+}
+
+impl StorageKey for B256 {
     fn as_storage_bytes(&self) -> impl AsRef<[u8]> {
         self.as_slice()
     }
