@@ -27,3 +27,5 @@ pub use bytes_like::BytesLikeHandler;
 pub use mapping::Mapping;
 pub use vec::VecHandler;
 pub use runtime::{PrecompileStorageProvider, RuntimeContext, RuntimeStorageOps, StorageMode};
+#[cfg(feature = "revm")]
+pub use runtime::RevmStorageProvider;

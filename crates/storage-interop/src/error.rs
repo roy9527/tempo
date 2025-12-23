@@ -10,6 +10,10 @@ pub enum InteropError {
     InvalidSignedEncoding,
     #[error("invalid utf-8 string data")]
     InvalidUtf8,
+    #[error("out of gas")]
+    OutOfGas,
+    #[error("runtime error: {0}")]
+    RuntimeError(String),
 }
 
 pub type Result<T> = std::result::Result<T, InteropError>;
