@@ -11961,6 +11961,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tempo-storage-interop"
+version = "0.8.0"
+dependencies = [
+ "alloy-primitives",
+ "proptest",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "tempo-telemetry-util"
 version = "0.8.0"
 dependencies = [
