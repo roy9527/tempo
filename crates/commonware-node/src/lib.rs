@@ -7,7 +7,6 @@ pub(crate) mod alias;
 mod args;
 pub(crate) mod config;
 pub mod consensus;
-pub(crate) mod db;
 pub(crate) mod dkg;
 pub(crate) mod epoch;
 pub mod metrics;
@@ -24,11 +23,12 @@ use eyre::{OptionExt, WrapErr as _, eyre};
 use tempo_commonware_node_config::SigningShare;
 use tempo_node::TempoFullNode;
 
-use crate::config::{
-    BOUNDARY_CERT_CHANNEL_IDENT, BOUNDARY_CERT_LIMIT, BROADCASTER_CHANNEL_IDENT, BROADCASTER_LIMIT,
-    DKG_CHANNEL_IDENT, DKG_LIMIT, MARSHAL_CHANNEL_IDENT, MARSHAL_LIMIT, PEERSETS_TO_TRACK,
-    PENDING_CHANNEL_IDENT, PENDING_LIMIT, RECOVERED_CHANNEL_IDENT, RECOVERED_LIMIT,
-    RESOLVER_CHANNEL_IDENT, RESOLVER_LIMIT, SUBBLOCKS_CHANNEL_IDENT, SUBBLOCKS_LIMIT,
+use crate::config::PEERSETS_TO_TRACK;
+pub use crate::config::{
+    BROADCASTER_CHANNEL_IDENT, BROADCASTER_LIMIT, DKG_CHANNEL_IDENT, DKG_LIMIT,
+    MARSHAL_CHANNEL_IDENT, MARSHAL_LIMIT, PENDING_CHANNEL_IDENT, PENDING_LIMIT,
+    RECOVERED_CHANNEL_IDENT, RECOVERED_LIMIT, RESOLVER_CHANNEL_IDENT, RESOLVER_LIMIT,
+    SUBBLOCKS_CHANNEL_IDENT, SUBBLOCKS_LIMIT,
 };
 
 pub use args::Args;
@@ -62,7 +62,7 @@ pub async fn run_consensus_stack(
         config.listen_address,
         config.mailbox_size,
         config.max_message_size_bytes,
-        config.allow_unregistered_handshakes,
+        config.bypass_ip_check,
     )
     .await
     .wrap_err("failed to start network")?;
@@ -78,11 +78,6 @@ pub async fn run_consensus_stack(
     );
     let marshal = network.register(MARSHAL_CHANNEL_IDENT, MARSHAL_LIMIT, message_backlog);
     let dkg = network.register(DKG_CHANNEL_IDENT, DKG_LIMIT, message_backlog);
-    let boundary_certificates = network.register(
-        BOUNDARY_CERT_CHANNEL_IDENT,
-        BOUNDARY_CERT_LIMIT,
-        message_backlog,
-    );
     let subblocks = network.register(SUBBLOCKS_CHANNEL_IDENT, SUBBLOCKS_LIMIT, message_backlog);
 
     let fee_recipient = config
@@ -101,7 +96,6 @@ pub async fn run_consensus_stack(
         partition_prefix: "engine".into(),
         signer: signing_key.into_inner(),
         share,
-        delete_signing_share: config.delete_signing_share,
 
         mailbox_size: config.mailbox_size,
         deque_size: config.deque_size,
@@ -150,7 +144,6 @@ pub async fn run_consensus_stack(
             broadcaster,
             marshal,
             dkg,
-            boundary_certificates,
             subblocks,
         ),
     );
@@ -175,8 +168,8 @@ async fn instantiate_network(
     signing_key: PrivateKey,
     listen_addr: SocketAddr,
     mailbox_size: usize,
-    max_message_size: usize,
-    allow_unregistered_handshakes: bool,
+    max_message_size: u32,
+    bypass_ip_check: bool,
 ) -> eyre::Result<(
     lookup::Network<commonware_runtime::tokio::Context, PrivateKey>,
     lookup::Oracle<PublicKey>,
@@ -187,7 +180,7 @@ async fn instantiate_network(
     let p2p_cfg = lookup::Config {
         mailbox_size,
         tracked_peer_sets: PEERSETS_TO_TRACK,
-        attempt_unregistered_handshakes: allow_unregistered_handshakes,
+        bypass_ip_check,
         ..lookup::Config::local(signing_key, &p2p_namespace, listen_addr, max_message_size)
     };
 

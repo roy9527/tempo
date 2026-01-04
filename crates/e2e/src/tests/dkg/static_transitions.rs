@@ -1,6 +1,6 @@
 //! Tests for successful DKG ceremonies with static sets of validators.
 //!
-//! Contains test for both pre-allegretto logic, and allegretto logic active
+//! Contains test for DKG transition logic
 //! at genesis.
 use commonware_macros::test_traced;
 
@@ -20,7 +20,7 @@ fn single_validator_can_transition_once() {
 fn single_validator_can_transition_twice() {
     AssertStaticTransitions {
         how_many: 1,
-        epoch_length: 20,
+        epoch_length: 10,
         transitions: 2,
     }
     .run();
@@ -30,7 +30,7 @@ fn single_validator_can_transition_twice() {
 fn single_validator_can_transition_four_times() {
     AssertStaticTransitions {
         how_many: 1,
-        epoch_length: 20,
+        epoch_length: 10,
         transitions: 4,
     }
     .run();
