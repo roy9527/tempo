@@ -92,6 +92,8 @@ pub struct Builder<TBlocker, TContext, TPeerManager> {
     pub new_payload_wait_time: Duration,
     pub time_to_build_subblock: Duration,
     pub subblock_broadcast_interval: Duration,
+
+    pub feed_state: crate::feed::FeedStateHandle,
 }
 
 impl<TBlocker, TContext, TPeerManager> Builder<TBlocker, TContext, TPeerManager>
@@ -260,7 +262,6 @@ where
                     self.views_to_track
                         .saturating_mul(SYNCER_ACTIVITY_TIMEOUT_MULTIPLIER),
                 ),
-                namespace: crate::config::NAMESPACE.to_vec(),
                 prunable_items_per_section: PRUNABLE_ITEMS_PER_SECTION,
 
                 buffer_pool: buffer_pool.clone(),
@@ -284,13 +285,29 @@ where
             epoch_strategy: epoch_strategy.clone(),
         });
 
+        let (feed, feed_mailbox) = crate::feed::init(
+            self.context.with_label("feed"),
+            marshal_mailbox.clone(),
+            self.feed_state,
+        );
+
+        let (executor, executor_mailbox) = crate::executor::init(
+            self.context.with_label("executor"),
+            crate::executor::Config {
+                execution_node: execution_node.clone(),
+                last_finalized_height,
+                marshal: marshal_mailbox.clone(),
+            },
+        )
+        .wrap_err("failed initialization executor actor")?;
+
         let (application, application_mailbox) = application::init(super::application::Config {
             context: self.context.with_label("application"),
             fee_recipient: self.fee_recipient,
-            last_finalized_height,
             mailbox_size: self.mailbox_size,
             marshal: marshal_mailbox.clone(),
             execution_node: execution_node.clone(),
+            executor: executor_mailbox.clone(),
             new_payload_wait_time: self.new_payload_wait_time,
             subblocks: subblocks.mailbox(),
             scheme_provider: scheme_provider.clone(),
@@ -310,6 +327,7 @@ where
                 mailbox_size: self.mailbox_size,
                 subblocks: subblocks.mailbox(),
                 marshal: marshal_mailbox.clone(),
+                feed: feed_mailbox.clone(),
                 scheme_provider: scheme_provider.clone(),
                 time_to_collect_notarizations: self.time_to_collect_notarizations,
                 time_to_retry_nullify_broadcast: self.time_to_retry_nullify_broadcast,
@@ -348,13 +366,17 @@ where
             dkg_manager_mailbox,
 
             application,
-            application_mailbox,
+
+            executor,
+            executor_mailbox,
 
             resolver_config,
             marshal,
 
             epoch_manager,
             epoch_manager_mailbox,
+
+            feed,
 
             subblocks,
         })
@@ -385,9 +407,15 @@ where
     dkg_manager: dkg::manager::Actor<TContext, TPeerManager>,
     dkg_manager_mailbox: dkg::manager::Mailbox,
 
-    /// The core of the application, the glue between commonware-xyz consensus and reth-execution.
+    /// Acts as the glue between the consensus and execution layers implementing
+    /// the `[commonware_consensus::Automaton]` trait.
     application: application::Actor<TContext>,
-    application_mailbox: application::Mailbox,
+
+    /// Responsible for keeping the consensus layer state and execution layer
+    /// states in sync. Drives the chain state of the execution layer by sending
+    /// forkchoice-updates.
+    executor: crate::executor::Actor<TContext>,
+    executor_mailbox: crate::executor::Mailbox,
 
     /// Resolver config that will be passed to the marshal actor upon start.
     resolver_config: marshal::resolver::p2p::Config<PublicKey, TPeerManager, TBlocker>,
@@ -398,6 +426,8 @@ where
 
     epoch_manager: epoch::manager::Actor<TBlocker, TContext>,
     epoch_manager_mailbox: epoch::manager::Mailbox,
+
+    feed: crate::feed::Actor<TContext>,
 
     subblocks: subblocks::Actor<TContext>,
 }
@@ -507,11 +537,12 @@ where
             marshal::resolver::p2p::init(&self.context, self.resolver_config, marshal_channel);
 
         let application = self.application.start(self.dkg_manager_mailbox.clone());
+        let executor = self.executor.start();
 
         let marshal = self.marshal.start(
             Reporters::from((
                 self.epoch_manager_mailbox,
-                Reporters::from((self.application_mailbox, self.dkg_manager_mailbox.clone())),
+                Reporters::from((self.executor_mailbox, self.dkg_manager_mailbox.clone())),
             )),
             self.broadcast_mailbox,
             resolver,
@@ -520,6 +551,8 @@ where
         let epoch_manager =
             self.epoch_manager
                 .start(pending_channel, recovered_channel, resolver_channel);
+
+        let feed = self.feed.start();
 
         let subblocks = self
             .context
@@ -531,6 +564,8 @@ where
             application,
             broadcast,
             epoch_manager,
+            executor,
+            feed,
             marshal,
             dkg_manager,
             subblocks,
