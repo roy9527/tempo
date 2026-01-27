@@ -42,8 +42,8 @@ use std::{
     },
     time::Instant,
 };
-use tempo_chainspec::TempoChainSpec;
-use tempo_consensus::{TEMPO_GENERAL_GAS_DIVISOR, TEMPO_SHARED_GAS_DIVISOR};
+use tempo_chainspec::{TempoChainSpec, hardfork::TempoHardforks};
+use tempo_consensus::TEMPO_SHARED_GAS_DIVISOR;
 use tempo_evm::{TempoEvmConfig, TempoNextBlockEnvAttributes};
 use tempo_payload_types::TempoPayloadBuilderAttributes;
 use tempo_primitives::{
@@ -59,6 +59,14 @@ use tempo_transaction_pool::{
     transaction::{TempoPoolTransactionError, TempoPooledTransaction},
 };
 use tracing::{Level, debug, error, info, instrument, trace, warn};
+
+/// Returns true if a subblock has any expired transactions for the given timestamp.
+fn has_expired_transactions(subblock: &RecoveredSubBlock, timestamp: u64) -> bool {
+    subblock.transactions.iter().any(|tx| {
+        tx.as_aa()
+            .is_some_and(|tx| tx.tx().valid_before.is_some_and(|valid| valid <= timestamp))
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct TempoPayloadBuilder<Provider> {
@@ -254,8 +262,14 @@ where
 
         let block_gas_limit: u64 = parent_header.gas_limit();
         let shared_gas_limit = block_gas_limit / TEMPO_SHARED_GAS_DIVISOR;
+        // Non-shared gas limit is the maximum gas available for proposer's pool transactions.
+        // The remaining `shared_gas_limit` is reserved for validator subblocks.
         let non_shared_gas_limit = block_gas_limit - shared_gas_limit;
-        let general_gas_limit = non_shared_gas_limit / TEMPO_GENERAL_GAS_DIVISOR;
+        let general_gas_limit = chain_spec.general_gas_limit_at(
+            attributes.timestamp(),
+            block_gas_limit,
+            shared_gas_limit,
+        );
 
         let mut cumulative_gas_used = 0;
         let mut non_payment_gas_used = 0;
@@ -282,13 +296,7 @@ where
             // We pre-validate all of the subblocks on top of parent state in subblocks service
             // which leaves the only reason for transactions to get invalidated by expiry of
             // `valid_before` field.
-            if subblock.transactions.iter().any(|tx| {
-                tx.as_aa().is_some_and(|tx| {
-                    tx.tx()
-                        .valid_before
-                        .is_some_and(|valid| valid < attributes.timestamp())
-                })
-            }) {
+            if has_expired_transactions(subblock, attributes.timestamp()) {
                 return false;
             }
 
@@ -361,7 +369,9 @@ where
 
         let execution_start = Instant::now();
         while let Some(pool_tx) = best_txs.next() {
-            // ensure we still have capacity for this transaction
+            // Ensure we still have capacity for this transaction within the non-shared gas limit.
+            // The remaining `shared_gas_limit` is reserved for validator subblocks and must not
+            // be consumed by proposer's pool transactions.
             if cumulative_gas_used + pool_tx.gas_limit() > non_shared_gas_limit {
                 // Mark this transaction as invalid since it doesn't fit
                 // The iterator will handle lane switching internally when appropriate
@@ -575,10 +585,11 @@ where
             .then_some(execution_result.requests);
 
         let sealed_block = Arc::new(block.sealed_block().clone());
+        let rlp_length = sealed_block.rlp_length();
 
-        if is_osaka && sealed_block.rlp_length() > MAX_RLP_BLOCK_SIZE {
+        if is_osaka && rlp_length > MAX_RLP_BLOCK_SIZE {
             return Err(PayloadBuilderError::other(ConsensusError::BlockTooLarge {
-                rlp_length: sealed_block.rlp_length(),
+                rlp_length,
                 max_rlp_length: MAX_RLP_BLOCK_SIZE,
             }));
         }
@@ -588,6 +599,10 @@ where
         let gas_per_second = sealed_block.gas_used() as f64 / elapsed.as_secs_f64();
         self.metrics.gas_per_second.record(gas_per_second);
         self.metrics.gas_per_second_last.set(gas_per_second);
+        self.metrics.rlp_block_size_bytes.record(rlp_length as f64);
+        self.metrics
+            .rlp_block_size_bytes_last
+            .set(rlp_length as f64);
 
         info!(
             parent_hash = ?sealed_block.parent_hash(),
@@ -644,8 +659,125 @@ pub fn is_more_subblocks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Address, B256, Bytes};
+    use alloy_consensus::BlockBody;
+    use alloy_primitives::{Address, B256, Bytes, Signature};
     use reth_payload_builder::PayloadId;
+    use reth_primitives_traits::SealedBlock;
+    use tempo_primitives::{
+        AASigned, Block, SignedSubBlock, SubBlock, SubBlockVersion, TempoSignature,
+        TempoTransaction,
+    };
+
+    trait TestExt {
+        fn random() -> Self;
+        fn with_valid_before(_: Option<u64>) -> Self
+        where
+            Self: Sized,
+        {
+            Self::random()
+        }
+    }
+
+    impl TestExt for SubBlockMetadata {
+        fn random() -> Self {
+            Self {
+                version: SubBlockVersion::V1,
+                validator: B256::random(),
+                fee_recipient: Address::random(),
+                signature: Bytes::new(),
+            }
+        }
+    }
+
+    impl TestExt for RecoveredSubBlock {
+        fn random() -> Self {
+            Self::with_valid_before(None)
+        }
+
+        fn with_valid_before(valid_before: Option<u64>) -> Self {
+            let tx = TempoTxEnvelope::AA(AASigned::new_unhashed(
+                TempoTransaction {
+                    valid_before,
+                    ..Default::default()
+                },
+                TempoSignature::default(),
+            ));
+            let signed = SignedSubBlock {
+                inner: SubBlock {
+                    version: SubBlockVersion::V1,
+                    parent_hash: B256::random(),
+                    fee_recipient: Address::random(),
+                    transactions: vec![tx],
+                },
+                signature: Bytes::new(),
+            };
+            Self::new_unchecked(signed, vec![Address::ZERO], B256::ZERO)
+        }
+    }
+
+    fn payload_with_metadata(count: usize) -> EthBuiltPayload<TempoPrimitives> {
+        let metadata: Vec<_> = (0..count).map(|_| SubBlockMetadata::random()).collect();
+        let input: Bytes = alloy_rlp::encode(&metadata).into();
+        let tx = TempoTxEnvelope::Legacy(Signed::new_unhashed(
+            TxLegacy {
+                chain_id: None,
+                nonce: 0,
+                gas_price: 0,
+                gas_limit: 0,
+                to: Address::random().into(),
+                value: U256::ZERO,
+                input,
+            },
+            Signature::test_signature(),
+        ));
+        let block = Block {
+            header: TempoHeader::default(),
+            body: BlockBody {
+                transactions: vec![tx],
+                ommers: vec![],
+                withdrawals: None,
+            },
+        };
+        let sealed = Arc::new(SealedBlock::seal_slow(block));
+        EthBuiltPayload::new(PayloadId::default(), sealed, U256::ZERO, None)
+    }
+
+    #[test]
+    fn test_is_more_subblocks() {
+        // None payload always returns false
+        assert!(!is_more_subblocks(None, &[]));
+        assert!(!is_more_subblocks(None, &[RecoveredSubBlock::random()]));
+
+        // Equal count returns false (1 == 1)
+        let payload = payload_with_metadata(1);
+        assert!(!is_more_subblocks(
+            Some(&payload),
+            &[RecoveredSubBlock::random()]
+        ));
+
+        // More subblocks returns true (2 > 1)
+        assert!(is_more_subblocks(
+            Some(&payload),
+            &[RecoveredSubBlock::random(), RecoveredSubBlock::random()]
+        ));
+
+        // Fewer subblocks returns false (1 < 2)
+        let payload = payload_with_metadata(2);
+        assert!(!is_more_subblocks(
+            Some(&payload),
+            &[RecoveredSubBlock::random()]
+        ));
+
+        // Empty metadata, empty subblocks returns false (0 > 0 is false)
+        let payload = payload_with_metadata(0);
+        assert!(!is_more_subblocks(Some(&payload), &[]));
+
+        // Empty metadata, one subblock returns true (1 > 0)
+        assert!(is_more_subblocks(
+            Some(&payload),
+            &[RecoveredSubBlock::random()]
+        ));
+    }
 
     #[test]
     fn test_extra_data_flow_in_attributes() {
@@ -667,5 +799,22 @@ mod tests {
         let injected_data = attrs.extra_data().clone();
 
         assert_eq!(injected_data, extra_data);
+    }
+
+    #[test]
+    fn test_has_expired_transactions_boundary() {
+        // valid_before == timestamp → expired
+        let subblock = RecoveredSubBlock::with_valid_before(Some(1000));
+        assert!(has_expired_transactions(&subblock, 1000));
+
+        // valid_before < timestamp → expired
+        assert!(has_expired_transactions(&subblock, 1001));
+
+        // valid_before > timestamp → NOT expired
+        assert!(!has_expired_transactions(&subblock, 999));
+
+        // No valid_before → NOT expired
+        let subblock_no_expiry = RecoveredSubBlock::with_valid_before(None);
+        assert!(!has_expired_transactions(&subblock_no_expiry, 1000));
     }
 }

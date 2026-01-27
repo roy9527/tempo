@@ -1,17 +1,14 @@
+use crate::{
+    subblock::{PartialValidatorKey, has_sub_block_nonce_key_prefix},
+    transaction::{
+        AASigned, TempoSignature, TempoSignedAuthorization,
+        key_authorization::SignedKeyAuthorization,
+    },
+};
 use alloy_consensus::{SignableTransaction, Transaction, crypto::RecoveryError};
 use alloy_eips::{Typed2718, eip2930::AccessList, eip7702::SignedAuthorization};
 use alloy_primitives::{Address, B256, Bytes, ChainId, Signature, TxKind, U256, keccak256};
 use alloy_rlp::{Buf, BufMut, Decodable, EMPTY_STRING_CODE, Encodable};
-use core::mem;
-
-use crate::transaction::{
-    AASigned, TempoSignature, TempoSignedAuthorization, key_authorization::SignedKeyAuthorization,
-};
-
-use crate::{
-    subblock::{PartialValidatorKey, has_sub_block_nonce_key_prefix},
-    transaction::KeyAuthorization,
-};
 
 /// Tempo transaction type byte (0x76)
 pub const TEMPO_TX_TYPE_ID: u8 = 0x76;
@@ -23,6 +20,12 @@ pub const FEE_PAYER_SIGNATURE_MAGIC_BYTE: u8 = 0x78;
 pub const SECP256K1_SIGNATURE_LENGTH: usize = 65;
 pub const P256_SIGNATURE_LENGTH: usize = 129;
 pub const MAX_WEBAUTHN_SIGNATURE_LENGTH: usize = 2048; // 2KB max
+
+/// Nonce key marking an expiring nonce transaction (uses tx hash for replay protection).
+pub const TEMPO_EXPIRING_NONCE_KEY: U256 = U256::MAX;
+
+/// Maximum allowed expiry window for expiring nonce transactions (30 seconds).
+pub const TEMPO_EXPIRING_NONCE_MAX_EXPIRY_SECS: u64 = 30;
 
 /// Signature type enumeration
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -105,6 +108,10 @@ impl Call {
             list: true,
             payload_length,
         }
+    }
+
+    fn size(&self) -> usize {
+        size_of::<Self>() + self.input.len()
     }
 }
 
@@ -269,10 +276,31 @@ impl TempoTransaction {
         TEMPO_TX_TYPE_ID
     }
 
+    /// Returns true if this is an expiring nonce transaction.
+    ///
+    /// Expiring nonce transactions use the tx hash for replay protection instead of
+    /// sequential nonces. They are identified by `nonce_key == U256::MAX`.
+    #[inline]
+    pub fn is_expiring_nonce_tx(&self) -> bool {
+        self.nonce_key == TEMPO_EXPIRING_NONCE_KEY
+    }
+
     /// Validates the transaction according to the spec rules
     pub fn validate(&self) -> Result<(), &'static str> {
         // Validate calls list structure using the shared function
         validate_calls(&self.calls, !self.tempo_authorization_list.is_empty())?;
+
+        // Validate expiring nonce transaction constraints
+        if self.is_expiring_nonce_tx() {
+            // Expiring nonce txs must have nonce == 0
+            if self.nonce != 0 {
+                return Err("expiring nonce transactions must have nonce == 0");
+            }
+            // Expiring nonce txs must have valid_before set
+            if self.valid_before.is_none() {
+                return Err("expiring nonce transactions must have valid_before set");
+            }
+        }
 
         // validBefore must be greater than validAfter if both are set
         if let Some(valid_after) = self.valid_after
@@ -288,23 +316,15 @@ impl TempoTransaction {
     /// Calculates a heuristic for the in-memory size of the transaction
     #[inline]
     pub fn size(&self) -> usize {
-        mem::size_of::<ChainId>() + // chain_id
-        mem::size_of::<Option<Address>>() + // fee_token
-        mem::size_of::<u128>() + // max_priority_fee_per_gas
-        mem::size_of::<u128>() + // max_fee_per_gas
-        mem::size_of::<u64>() + // gas_limit
-        self.calls.iter().map(|call| {
-            mem::size_of::<TxKind>() + mem::size_of::<U256>() + call.input.len()
-        }).sum::<usize>() + // calls
-        self.access_list.size() + // access_list
-        mem::size_of::<U256>() + // nonce_key
-        mem::size_of::<u64>() + // nonce
-        mem::size_of::<Option<Signature>>() + // fee_payer_signature
-        mem::size_of::<Option<u64>>() + // valid_before
-        mem::size_of::<Option<u64>>() + // valid_after
-        // key_authorization (optional)
-        self.key_authorization.as_ref().map(|k| k.size()).unwrap_or(mem::size_of::<Option<KeyAuthorization>>()) +
-        self.tempo_authorization_list.iter().map(|auth| auth.size()).sum::<usize>() // authorization_list
+        size_of::<Self>()
+            + self.calls.iter().map(|call| call.size()).sum::<usize>()
+            + self.access_list.size()
+            + self.key_authorization.as_ref().map_or(0, |k| k.size())
+            + self
+                .tempo_authorization_list
+                .iter()
+                .map(|auth| auth.size())
+                .sum::<usize>()
     }
 
     /// Convert the transaction into a signed transaction
@@ -669,10 +689,10 @@ impl Transaction for TempoTransaction {
 
     #[inline]
     fn value(&self) -> U256 {
-        // Return sum of all call values
+        // Return sum of all call values, saturating to U256::MAX on overflow
         self.calls
             .iter()
-            .fold(U256::ZERO, |acc, call| acc + call.value)
+            .fold(U256::ZERO, |acc, call| acc.saturating_add(call.value))
     }
 
     #[inline]
@@ -919,9 +939,17 @@ mod serde_input {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transaction::tt_signature::{
-        PrimitiveSignature, TempoSignature, derive_p256_address,
+    use crate::{
+        TempoTxEnvelope,
+        transaction::{
+            KeyAuthorization, TempoSignedAuthorization,
+            tt_signature::{
+                PrimitiveSignature, SIGNATURE_TYPE_P256, SIGNATURE_TYPE_WEBAUTHN, TempoSignature,
+                derive_p256_address,
+            },
+        },
     };
+    use alloy_eips::{Decodable2718, Encodable2718, eip7702::Authorization};
     use alloy_primitives::{Address, Bytes, Signature, TxKind, U256, address, bytes, hex};
     use alloy_rlp::{Decodable, Encodable};
 
@@ -989,8 +1017,6 @@ mod tests {
 
     #[test]
     fn test_signature_type_detection() {
-        use crate::transaction::tt_signature::{SIGNATURE_TYPE_P256, SIGNATURE_TYPE_WEBAUTHN};
-
         // Secp256k1 (detected by 65-byte length, no type identifier)
         let sig1_bytes = vec![0u8; SECP256K1_SIGNATURE_LENGTH];
         let sig1 = TempoSignature::from_bytes(&sig1_bytes).unwrap();
@@ -1120,8 +1146,6 @@ mod tests {
 
     #[test]
     fn test_nonce_system() {
-        use alloy_consensus::Transaction;
-
         // Create a dummy call to satisfy validation
         let dummy_call = Call {
             to: TxKind::Create,
@@ -1184,8 +1208,6 @@ mod tests {
 
     #[test]
     fn test_transaction_trait_impl() {
-        use alloy_consensus::Transaction;
-
         let call = Call {
             to: TxKind::Call(address!("0000000000000000000000000000000000000002")),
             value: U256::from(1000),
@@ -1212,8 +1234,6 @@ mod tests {
 
     #[test]
     fn test_effective_gas_price() {
-        use alloy_consensus::Transaction;
-
         // Create a dummy call to satisfy validation
         let dummy_call = Call {
             to: TxKind::Create,
@@ -1690,9 +1710,6 @@ mod tests {
     #[test]
     fn test_tempo_transaction_envelope_roundtrip_without_key_auth() {
         // Test that TempoTransaction in envelope works without key_authorization
-        use crate::TempoTxEnvelope;
-        use alloy_eips::eip2718::{Decodable2718, Encodable2718};
-
         let call = Call {
             to: TxKind::Create,
             value: U256::ZERO,
@@ -1741,8 +1758,8 @@ mod tests {
     fn test_call_decode_rejects_malformed_rlp() {
         // Test that Call decoding rejects RLP with mismatched header length
         let call = Call {
-            to: TxKind::Call(address!("0000000000000000000000000000000000000002")),
-            value: U256::from(1000),
+            to: TxKind::Call(Address::random()),
+            value: U256::random(),
             input: Bytes::from(vec![1, 2, 3, 4]),
         };
 
@@ -1771,14 +1788,14 @@ mod tests {
     fn test_tempo_transaction_decode_rejects_malformed_rlp() {
         // Test that TempoTransaction decoding rejects RLP with mismatched header length
         let call = Call {
-            to: TxKind::Call(address!("0000000000000000000000000000000000000002")),
-            value: U256::from(1000),
+            to: TxKind::Call(Address::random()),
+            value: U256::random(),
             input: Bytes::from(vec![1, 2, 3, 4]),
         };
 
         let tx = TempoTransaction {
             chain_id: 1,
-            fee_token: Some(address!("0000000000000000000000000000000000000001")),
+            fee_token: Some(Address::random()),
             max_priority_fee_per_gas: 1000000000,
             max_fee_per_gas: 2000000000,
             gas_limit: 21000,
@@ -1829,62 +1846,6 @@ mod tests {
     }
 
     #[test]
-    fn test_size_accounts_for_all_fields() {
-        // This test ensures the size() function correctly accounts for all field types.
-        // If you add a new field to TempoTransaction or change a field's type,
-        // you must update both this test AND the size() function.
-        //
-        // The test calculates expected size by summing the size of each field type,
-        // which should match what size() computes for a minimal transaction.
-
-        let dummy_call = Call {
-            to: TxKind::Create,
-            value: U256::ZERO,
-            input: Bytes::new(),
-        };
-
-        let tx = TempoTransaction {
-            chain_id: 1,
-            fee_token: None,
-            max_priority_fee_per_gas: 0,
-            max_fee_per_gas: 0,
-            gas_limit: 0,
-            calls: vec![dummy_call],
-            access_list: Default::default(),
-            nonce_key: U256::ZERO,
-            nonce: 0,
-            fee_payer_signature: None,
-            valid_before: None,
-            valid_after: None,
-            key_authorization: None,
-            tempo_authorization_list: vec![],
-        };
-
-        // Calculate expected size by manually summing field sizes
-        // This acts as a specification that the size() function must match
-        let expected_size = mem::size_of::<ChainId>() + // chain_id: u64
-            mem::size_of::<Option<Address>>() + // fee_token: Option<Address>
-            mem::size_of::<u128>() + // max_priority_fee_per_gas: u128
-            mem::size_of::<u128>() + // max_fee_per_gas: u128
-            mem::size_of::<u64>() + // gas_limit: u64
-            (mem::size_of::<TxKind>() + mem::size_of::<U256>()) + // calls: one call with empty input
-            tx.access_list.size() + // access_list: AccessList
-            mem::size_of::<U256>() + // nonce_key: U256
-            mem::size_of::<u64>() + // nonce: u64
-            mem::size_of::<Option<Signature>>() + // fee_payer_signature: Option<Signature>
-            mem::size_of::<Option<u64>>() + // valid_before: Option<u64>
-            mem::size_of::<Option<u64>>() + // valid_after: Option<u64>
-            mem::size_of::<Option<KeyAuthorization>>(); // key_authorization + empty tempo_authorization_list
-
-        assert_eq!(
-            tx.size(),
-            expected_size,
-            "size() calculation doesn't match expected field sizes. \
-             If you added/changed a field in TempoTransaction, update both size() and this test."
-        );
-    }
-
-    #[test]
     fn test_create_must_be_first_call() {
         let create_call = Call {
             to: TxKind::Create,
@@ -1892,7 +1853,7 @@ mod tests {
             input: Bytes::new(),
         };
         let call_call = Call {
-            to: TxKind::Call(address!("0000000000000000000000000000000000000001")),
+            to: TxKind::Call(Address::random()),
             value: U256::ZERO,
             input: Bytes::new(),
         };
@@ -1943,16 +1904,45 @@ mod tests {
     }
 
     #[test]
+    fn test_create_forbidden_with_auth_list() {
+        let create_call = Call {
+            to: TxKind::Create,
+            value: U256::ZERO,
+            input: Bytes::new(),
+        };
+
+        let signed_auth = TempoSignedAuthorization::new_unchecked(
+            Authorization {
+                chain_id: U256::ONE,
+                address: Address::random(),
+                nonce: 1,
+            },
+            TempoSignature::Primitive(PrimitiveSignature::Secp256k1(Signature::test_signature())),
+        );
+
+        // Invalid: CREATE call with auth list
+        let tx = TempoTransaction {
+            calls: vec![create_call],
+            tempo_authorization_list: vec![signed_auth],
+            ..Default::default()
+        };
+
+        let result = tx.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("aa_authorization_list"));
+    }
+
+    #[test]
     fn test_create_validation_allows_call_only_batch() {
         // A batch with only CALL operations should be valid
         let call1 = Call {
-            to: TxKind::Call(address!("0000000000000000000000000000000000000001")),
+            to: TxKind::Call(Address::random()),
             value: U256::ZERO,
             input: Bytes::new(),
         };
         let call2 = Call {
-            to: TxKind::Call(address!("0000000000000000000000000000000000000002")),
-            value: U256::from(100),
+            to: TxKind::Call(Address::random()),
+            value: U256::random(),
             input: Bytes::from(vec![1, 2, 3]),
         };
 
@@ -1961,5 +1951,26 @@ mod tests {
             ..Default::default()
         };
         assert!(tx.validate().is_ok());
+    }
+
+    #[test]
+    fn test_value_saturates_on_overflow() {
+        let call1 = Call {
+            to: TxKind::Call(Address::ZERO),
+            value: U256::MAX,
+            input: Bytes::new(),
+        };
+        let call2 = Call {
+            to: TxKind::Call(Address::ZERO),
+            value: U256::from(1),
+            input: Bytes::new(),
+        };
+
+        let tx = TempoTransaction {
+            calls: vec![call1, call2],
+            ..Default::default()
+        };
+
+        assert_eq!(tx.value(), U256::MAX);
     }
 }

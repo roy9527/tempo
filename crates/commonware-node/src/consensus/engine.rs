@@ -3,14 +3,14 @@
 //! [`alto`]: https://github.com/commonwarexyx/alto
 
 use std::{
-    num::{NonZeroU64, NonZeroUsize},
+    num::{NonZeroU16, NonZeroU64, NonZeroUsize},
     time::{Duration, Instant},
 };
 
 use commonware_broadcast::buffered;
 use commonware_consensus::{
     Reporters, marshal,
-    simplex::scheme::bls12381_threshold::Scheme,
+    simplex::scheme::bls12381_threshold::vrf::Scheme,
     types::{FixedEpocher, ViewDelta},
 };
 use commonware_cryptography::{
@@ -20,6 +20,7 @@ use commonware_cryptography::{
     ed25519::{PrivateKey, PublicKey},
 };
 use commonware_p2p::{Address, Blocker, Receiver, Sender};
+use commonware_parallel::Sequential;
 use commonware_runtime::{
     Clock, ContextCell, Handle, Metrics, Network, Pacer, Spawner, Storage, buffer::PoolRef,
     spawn_cell,
@@ -52,11 +53,11 @@ const IMMUTABLE_ITEMS_PER_SECTION: NonZeroU64 =
     NonZeroU64::new(262_144).expect("value is not zero");
 const FREEZER_TABLE_RESIZE_FREQUENCY: u8 = 4;
 const FREEZER_TABLE_RESIZE_CHUNK_SIZE: u32 = 2u32.pow(16); // 3MB
-const FREEZER_JOURNAL_TARGET_SIZE: u64 = 1024 * 1024 * 1024; // 1GB
-const FREEZER_JOURNAL_COMPRESSION: Option<u8> = Some(3);
+const FREEZER_VALUE_TARGET_SIZE: u64 = 1024 * 1024 * 1024; // 1GB
+const FREEZER_VALUE_COMPRESSION: Option<u8> = Some(3);
 const REPLAY_BUFFER: NonZeroUsize = NonZeroUsize::new(8 * 1024 * 1024).expect("value is not zero"); // 8MB
 const WRITE_BUFFER: NonZeroUsize = NonZeroUsize::new(1024 * 1024).expect("value is not zero"); // 1MB
-const BUFFER_POOL_PAGE_SIZE: NonZeroUsize = NonZeroUsize::new(4_096).expect("value is not zero"); // 4KB
+const BUFFER_POOL_PAGE_SIZE: NonZeroU16 = NonZeroU16::new(4_096).expect("value is not zero"); // 4KB
 const BUFFER_POOL_CAPACITY: NonZeroUsize = NonZeroUsize::new(8_192).expect("value is not zero"); // 32MB
 const MAX_REPAIR: NonZeroUsize = NonZeroUsize::new(20).expect("value is not zero");
 
@@ -65,10 +66,7 @@ const MAX_REPAIR: NonZeroUsize = NonZeroUsize::new(20).expect("value is not zero
 // XXX: Mostly a one-to-one copy of alto for now. We also put the context in here
 // because there doesn't really seem to be a point putting it into an extra initializer.
 #[derive(Clone)]
-pub struct Builder<TBlocker, TContext, TPeerManager> {
-    /// The contextg
-    pub context: TContext,
-
+pub struct Builder<TBlocker, TPeerManager> {
     pub fee_recipient: alloy_primitives::Address,
 
     pub execution_node: Option<TempoFullNode>,
@@ -92,22 +90,14 @@ pub struct Builder<TBlocker, TContext, TPeerManager> {
     pub new_payload_wait_time: Duration,
     pub time_to_build_subblock: Duration,
     pub subblock_broadcast_interval: Duration,
+    pub fcu_heartbeat_interval: Duration,
 
     pub feed_state: crate::feed::FeedStateHandle,
 }
 
-impl<TBlocker, TContext, TPeerManager> Builder<TBlocker, TContext, TPeerManager>
+impl<TBlocker, TPeerManager> Builder<TBlocker, TPeerManager>
 where
     TBlocker: Blocker<PublicKey = PublicKey>,
-    TContext: Clock
-        + governor::clock::Clock
-        + Rng
-        + CryptoRng
-        + Pacer
-        + Spawner
-        + Storage
-        + Metrics
-        + Network,
     TPeerManager:
         commonware_p2p::Manager<PublicKey = PublicKey, Peers = Map<PublicKey, Address>> + Sync,
 {
@@ -116,7 +106,21 @@ where
         self
     }
 
-    pub async fn try_init(self) -> eyre::Result<Engine<TBlocker, TContext, TPeerManager>> {
+    pub async fn try_init<TContext>(
+        self,
+        context: TContext,
+    ) -> eyre::Result<Engine<TBlocker, TContext, TPeerManager>>
+    where
+        TContext: Clock
+            + governor::clock::Clock
+            + Rng
+            + CryptoRng
+            + Pacer
+            + Spawner
+            + Storage
+            + Metrics
+            + Network,
+    {
         let execution_node = self
             .execution_node
             .clone()
@@ -134,7 +138,7 @@ where
         );
 
         let (broadcast, broadcast_mailbox) = buffered::Engine::new(
-            self.context.with_label("broadcast"),
+            context.with_label("broadcast"),
             buffered::Config {
                 public_key: self.signer.public_key(),
                 mailbox_size: self.mailbox_size,
@@ -166,7 +170,7 @@ where
         const FINALIZATIONS_BY_HEIGHT: &str = "finalizations-by-height";
         let start = Instant::now();
         let finalizations_by_height = immutable::Archive::init(
-            self.context.with_label("finalizations_by_height"),
+            context.with_label("finalizations_by_height"),
             immutable::Config {
                 metadata_partition: format!(
                     "{}-{FINALIZATIONS_BY_HEIGHT}-metadata",
@@ -178,10 +182,22 @@ where
                     self.partition_prefix,
                 ),
 
-                freezer_journal_partition: format!(
-                    "{}-{FINALIZATIONS_BY_HEIGHT}-freezer-journal",
+                freezer_table_initial_size: BLOCKS_FREEZER_TABLE_INITIAL_SIZE_BYTES,
+                freezer_table_resize_frequency: FREEZER_TABLE_RESIZE_FREQUENCY,
+                freezer_table_resize_chunk_size: FREEZER_TABLE_RESIZE_CHUNK_SIZE,
+
+                freezer_key_partition: format!(
+                    "{}-{FINALIZATIONS_BY_HEIGHT}-freezer-key",
                     self.partition_prefix,
                 ),
+                freezer_key_buffer_pool: buffer_pool.clone(),
+
+                freezer_value_partition: format!(
+                    "{}-{FINALIZATIONS_BY_HEIGHT}-freezer-value",
+                    self.partition_prefix,
+                ),
+                freezer_value_target_size: FREEZER_VALUE_TARGET_SIZE,
+                freezer_value_compression: FREEZER_VALUE_COMPRESSION,
 
                 ordinal_partition: format!(
                     "{}-{FINALIZATIONS_BY_HEIGHT}-ordinal",
@@ -189,17 +205,12 @@ where
                 ),
 
                 items_per_section: IMMUTABLE_ITEMS_PER_SECTION,
-                freezer_table_initial_size: BLOCKS_FREEZER_TABLE_INITIAL_SIZE_BYTES,
-                freezer_table_resize_frequency: FREEZER_TABLE_RESIZE_FREQUENCY,
-                freezer_table_resize_chunk_size: FREEZER_TABLE_RESIZE_CHUNK_SIZE,
-                freezer_journal_target_size: FREEZER_JOURNAL_TARGET_SIZE,
-                freezer_journal_compression: FREEZER_JOURNAL_COMPRESSION,
-
-                freezer_journal_buffer_pool: buffer_pool.clone(),
-
-                write_buffer: WRITE_BUFFER,
-                replay_buffer: REPLAY_BUFFER,
                 codec_config: Scheme::<PublicKey, MinSig>::certificate_codec_config_unbounded(),
+
+                replay_buffer: REPLAY_BUFFER,
+                freezer_key_write_buffer: WRITE_BUFFER,
+                freezer_value_write_buffer: WRITE_BUFFER,
+                ordinal_write_buffer: WRITE_BUFFER,
             },
         )
         .await
@@ -209,7 +220,7 @@ where
         const FINALIZED_BLOCKS: &str = "finalized_blocks";
         let start = Instant::now();
         let finalized_blocks = immutable::Archive::init(
-            self.context.with_label("finalized_blocks"),
+            context.with_label("finalized_blocks"),
             immutable::Config {
                 metadata_partition: format!(
                     "{}-{FINALIZED_BLOCKS}-metadata",
@@ -221,25 +232,31 @@ where
                     self.partition_prefix,
                 ),
 
-                freezer_journal_partition: format!(
-                    "{}-{FINALIZED_BLOCKS}-freezer-journal",
-                    self.partition_prefix,
-                ),
-
-                ordinal_partition: format!("{}-{FINALIZED_BLOCKS}-ordinal", self.partition_prefix,),
-
-                items_per_section: IMMUTABLE_ITEMS_PER_SECTION,
                 freezer_table_initial_size: BLOCKS_FREEZER_TABLE_INITIAL_SIZE_BYTES,
                 freezer_table_resize_frequency: FREEZER_TABLE_RESIZE_FREQUENCY,
                 freezer_table_resize_chunk_size: FREEZER_TABLE_RESIZE_CHUNK_SIZE,
-                freezer_journal_target_size: FREEZER_JOURNAL_TARGET_SIZE,
-                freezer_journal_compression: FREEZER_JOURNAL_COMPRESSION,
 
-                freezer_journal_buffer_pool: buffer_pool.clone(),
+                freezer_key_partition: format!(
+                    "{}-{FINALIZED_BLOCKS}-freezer-key",
+                    self.partition_prefix,
+                ),
+                freezer_key_buffer_pool: buffer_pool.clone(),
 
-                write_buffer: WRITE_BUFFER,
-                replay_buffer: REPLAY_BUFFER,
+                freezer_value_partition: format!(
+                    "{}-{FINALIZED_BLOCKS}-freezer-value",
+                    self.partition_prefix,
+                ),
+                freezer_value_target_size: FREEZER_VALUE_TARGET_SIZE,
+                freezer_value_compression: FREEZER_VALUE_COMPRESSION,
+
+                ordinal_partition: format!("{}-{FINALIZED_BLOCKS}-ordinal", self.partition_prefix,),
+                items_per_section: IMMUTABLE_ITEMS_PER_SECTION,
                 codec_config: (),
+
+                replay_buffer: REPLAY_BUFFER,
+                freezer_key_write_buffer: WRITE_BUFFER,
+                freezer_value_write_buffer: WRITE_BUFFER,
+                ordinal_write_buffer: WRITE_BUFFER,
             },
         )
         .await
@@ -250,7 +267,7 @@ where
         // TODO(janis): forward `last_finalized_height` to application so it can
         // forward missing blocks to EL.
         let (marshal, marshal_mailbox, last_finalized_height) = marshal::Actor::init(
-            self.context.with_label("marshal"),
+            context.with_label("marshal"),
             finalizations_by_height,
             finalized_blocks,
             marshal::Config {
@@ -267,15 +284,18 @@ where
                 buffer_pool: buffer_pool.clone(),
 
                 replay_buffer: REPLAY_BUFFER,
-                write_buffer: WRITE_BUFFER,
+                key_write_buffer: WRITE_BUFFER,
+                value_write_buffer: WRITE_BUFFER,
                 max_repair: MAX_REPAIR,
                 block_codec_config: (),
+
+                strategy: Sequential,
             },
         )
         .await;
 
         let subblocks = subblocks::Actor::new(subblocks::Config {
-            context: self.context.clone(),
+            context: context.clone(),
             signer: self.signer.clone(),
             scheme_provider: scheme_provider.clone(),
             node: execution_node.clone(),
@@ -286,23 +306,25 @@ where
         });
 
         let (feed, feed_mailbox) = crate::feed::init(
-            self.context.with_label("feed"),
+            context.with_label("feed"),
             marshal_mailbox.clone(),
+            epoch_strategy.clone(),
             self.feed_state,
         );
 
         let (executor, executor_mailbox) = crate::executor::init(
-            self.context.with_label("executor"),
+            context.with_label("executor"),
             crate::executor::Config {
                 execution_node: execution_node.clone(),
                 last_finalized_height,
                 marshal: marshal_mailbox.clone(),
+                fcu_heartbeat_interval: self.fcu_heartbeat_interval,
             },
         )
         .wrap_err("failed initialization executor actor")?;
 
         let (application, application_mailbox) = application::init(super::application::Config {
-            context: self.context.with_label("application"),
+            context: context.with_label("application"),
             fee_recipient: self.fee_recipient,
             mailbox_size: self.mailbox_size,
             marshal: marshal_mailbox.clone(),
@@ -317,6 +339,7 @@ where
         .wrap_err("failed initializing application actor")?;
 
         let (epoch_manager, epoch_manager_mailbox) = epoch::manager::init(
+            context.with_label("epoch_manager"),
             epoch::manager::Config {
                 application: application_mailbox.clone(),
                 blocker: self.blocker.clone(),
@@ -335,11 +358,10 @@ where
                 views_to_track: ViewDelta::new(self.views_to_track),
                 views_until_leader_skip: ViewDelta::new(self.views_until_leader_skip),
             },
-            self.context.with_label("epoch_manager"),
         );
 
         let (dkg_manager, dkg_manager_mailbox) = dkg::manager::init(
-            self.context.with_label("dkg_manager"),
+            context.with_label("dkg_manager"),
             dkg::manager::Config {
                 epoch_manager: epoch_manager_mailbox.clone(),
                 epoch_strategy: epoch_strategy.clone(),
@@ -357,7 +379,7 @@ where
         .wrap_err("failed initializing dkg manager")?;
 
         Ok(Engine {
-            context: ContextCell::new(self.context),
+            context: ContextCell::new(context),
 
             broadcast,
             broadcast_mailbox,
@@ -453,11 +475,11 @@ where
     )]
     pub fn start(
         mut self,
-        pending_network: (
+        votes_network: (
             impl Sender<PublicKey = PublicKey>,
             impl Receiver<PublicKey = PublicKey>,
         ),
-        recovered_network: (
+        certificates_network: (
             impl Sender<PublicKey = PublicKey>,
             impl Receiver<PublicKey = PublicKey>,
         ),
@@ -485,8 +507,8 @@ where
         spawn_cell!(
             self.context,
             self.run(
-                pending_network,
-                recovered_network,
+                votes_network,
+                certificates_network,
                 resolver_network,
                 broadcast_network,
                 marshal_network,
@@ -503,11 +525,11 @@ where
     )]
     async fn run(
         self,
-        pending_channel: (
+        votes_channel: (
             impl Sender<PublicKey = PublicKey>,
             impl Receiver<PublicKey = PublicKey>,
         ),
-        recovered_channel: (
+        certificates_channel: (
             impl Sender<PublicKey = PublicKey>,
             impl Receiver<PublicKey = PublicKey>,
         ),
@@ -550,7 +572,7 @@ where
 
         let epoch_manager =
             self.epoch_manager
-                .start(pending_channel, recovered_channel, resolver_channel);
+                .start(votes_channel, certificates_channel, resolver_channel);
 
         let feed = self.feed.start();
 

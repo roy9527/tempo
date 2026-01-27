@@ -15,6 +15,12 @@ use tempo_revm::{TempoHaltReason, TempoInvalidTransaction, TempoTxEnv, evm::Temp
 
 use crate::TempoBlockEnv;
 
+/// TIP-1000 sets transaction gas limit cap to 30 million gas.
+///
+/// Increase of tx gas limit cap to 30M gas is to allow for maximum-sized
+/// contract deployments under TIP-1000 state creation costs.
+pub const TIP1000_TX_GAS_LIMIT_CAP: u64 = 30_000_000;
+
 #[derive(Debug, Default, Clone, Copy)]
 #[non_exhaustive]
 pub struct TempoEvmFactory;
@@ -234,26 +240,19 @@ where
 
 #[cfg(test)]
 mod tests {
-    use reth_revm::context::BlockEnv;
-    use revm::{context::TxEnv, database::EmptyDB};
+    use crate::test_utils::{test_evm, test_evm_with_basefee};
+    use revm::{
+        context::{CfgEnv, TxEnv},
+        database::{EmptyDB, in_memory_db::CacheDB},
+    };
+    use tempo_chainspec::hardfork::TempoHardfork;
+    use tempo_revm::gas_params::tempo_gas_params;
 
     use super::*;
 
     #[test]
     fn can_execute_system_tx() {
-        let mut evm = TempoEvm::new(
-            EmptyDB::default(),
-            EvmEnv {
-                block_env: TempoBlockEnv {
-                    inner: BlockEnv {
-                        basefee: 1,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        );
+        let mut evm = test_evm(EmptyDB::default());
         let result = evm
             .transact(TempoTxEnv {
                 inner: TxEnv {
@@ -268,5 +267,277 @@ mod tests {
             .unwrap();
 
         assert!(result.result.is_success());
+    }
+
+    #[test]
+    fn test_transact_raw() {
+        let mut evm = test_evm_with_basefee(EmptyDB::default(), 0);
+
+        let tx = TempoTxEnv {
+            inner: TxEnv {
+                caller: Address::repeat_byte(0x01),
+                gas_price: 0,
+                gas_limit: 21000,
+                kind: TxKind::Call(Address::repeat_byte(0x02)),
+                ..Default::default()
+            },
+            is_system_tx: false,
+            fee_token: None,
+            ..Default::default()
+        };
+
+        let result = evm.transact_raw(tx);
+        assert!(result.is_ok());
+
+        let result = result.unwrap();
+        assert!(result.result.is_success());
+        assert_eq!(result.result.gas_used(), 21000);
+    }
+
+    #[test]
+    fn test_transact_raw_system_tx() {
+        let mut evm = test_evm(EmptyDB::default());
+
+        // System transaction
+        let tx = TempoTxEnv {
+            inner: TxEnv {
+                caller: Address::ZERO,
+                gas_price: 0,
+                gas_limit: 21000,
+                kind: TxKind::Call(Address::repeat_byte(0x01)),
+                ..Default::default()
+            },
+            is_system_tx: true,
+            ..Default::default()
+        };
+
+        let result = evm.transact_raw(tx);
+        assert!(result.is_ok());
+
+        let result = result.unwrap();
+        assert!(result.result.is_success());
+        // System transactions should not consume gas
+        assert_eq!(result.result.gas_used(), 0);
+    }
+
+    #[test]
+    fn test_transact_raw_system_tx_must_be_call() {
+        let mut evm = test_evm(EmptyDB::default());
+
+        // System transaction with Create kind
+        let tx = TempoTxEnv {
+            inner: TxEnv {
+                caller: Address::ZERO,
+                gas_price: 0,
+                gas_limit: 21000,
+                kind: TxKind::Create,
+                ..Default::default()
+            },
+            is_system_tx: true,
+            ..Default::default()
+        };
+
+        let result = evm.transact_raw(tx);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            EVMError::Transaction(TempoInvalidTransaction::SystemTransactionMustBeCall)
+        ));
+    }
+
+    #[test]
+    fn test_transact_raw_system_tx_failed() {
+        let mut cache_db = CacheDB::new(EmptyDB::default());
+        // Deploy a contract that always reverts: PUSH1 0x00 PUSH1 0x00 REVERT (0x60006000fd)
+        let revert_code = Bytes::from_static(&[0x60, 0x00, 0x60, 0x00, 0xfd]);
+        let contract_addr = Address::repeat_byte(0xaa);
+
+        cache_db.insert_account_info(
+            contract_addr,
+            revm::state::AccountInfo {
+                code_hash: alloy_primitives::keccak256(&revert_code),
+                code: Some(revm::bytecode::Bytecode::new_raw(revert_code)),
+                ..Default::default()
+            },
+        );
+
+        let mut evm = test_evm(cache_db);
+
+        // System transaction that will fail with call to contract that reverts
+        let tx = TempoTxEnv {
+            inner: TxEnv {
+                caller: Address::ZERO,
+                gas_price: 0,
+                gas_limit: 1_000_000,
+                kind: TxKind::Call(contract_addr),
+                ..Default::default()
+            },
+            is_system_tx: true,
+            ..Default::default()
+        };
+
+        let result = evm.transact_raw(tx);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            EVMError::Transaction(TempoInvalidTransaction::SystemTransactionFailed(_))
+        ));
+    }
+
+    #[test]
+    fn test_transact_system_call() {
+        let mut evm = test_evm(EmptyDB::default());
+
+        let caller = Address::repeat_byte(0x01);
+        let contract = Address::repeat_byte(0x02);
+        let data = Bytes::from_static(&[0x01, 0x02, 0x03]);
+
+        let result = evm.transact_system_call(caller, contract, data);
+        assert!(result.is_ok());
+
+        let result = result.unwrap();
+        assert!(result.result.is_success());
+    }
+
+    #[test]
+    fn test_take_revert_logs() {
+        let mut evm = test_evm(EmptyDB::default());
+
+        assert!(evm.take_revert_logs().is_empty());
+
+        let log1 = Log::new_unchecked(
+            Address::repeat_byte(0x01),
+            vec![alloy_primitives::B256::repeat_byte(0xaa)],
+            Bytes::from_static(&[0x01, 0x02]),
+        );
+        let log2 = Log::new_unchecked(
+            Address::repeat_byte(0x02),
+            vec![],
+            Bytes::from_static(&[0x03, 0x04]),
+        );
+        evm.inner.logs.push(log1);
+        evm.inner.logs.push(log2);
+
+        let logs = evm.take_revert_logs();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].address, Address::repeat_byte(0x01));
+        assert_eq!(logs[1].address, Address::repeat_byte(0x02));
+
+        assert!(evm.take_revert_logs().is_empty());
+    }
+
+    // ==================== TIP-1000 EVM Configuration Tests ====================
+
+    /// Helper to create EvmEnv with a specific hardfork spec.
+    fn evm_env_with_spec(
+        spec: tempo_chainspec::hardfork::TempoHardfork,
+    ) -> EvmEnv<tempo_chainspec::hardfork::TempoHardfork, TempoBlockEnv> {
+        EvmEnv::<tempo_chainspec::hardfork::TempoHardfork, TempoBlockEnv>::new(
+            CfgEnv::new_with_spec_and_gas_params(spec, tempo_gas_params(spec)),
+            TempoBlockEnv::default(),
+        )
+    }
+
+    /// Test that TempoEvm applies custom gas params via `tempo_gas_params()`.
+    /// This verifies the TIP-1000 gas parameter override mechanism.
+    #[test]
+    fn test_tempo_evm_applies_gas_params() {
+        // Create EVM with T1 hardfork to get TIP-1000 gas params
+        let evm = TempoEvm::new(EmptyDB::default(), evm_env_with_spec(TempoHardfork::T1));
+
+        // Verify gas params were applied (check a known T1 override)
+        // T1 has tx_eip7702_per_empty_account_cost = 12,500
+        let gas_params = &evm.ctx().cfg.gas_params;
+        assert_eq!(
+            gas_params.tx_eip7702_per_empty_account_cost(),
+            12_500,
+            "T1 should have EIP-7702 per empty account cost of 12,500"
+        );
+    }
+
+    /// Test that TempoEvm respects the gas limit cap passed in via EvmEnv.
+    /// Note: The 30M TIP-1000 gas cap is set in ConfigureEvm::evm_env(), not here.
+    /// This test verifies that TempoEvm::new() preserves the cap from the input.
+    #[test]
+    fn test_tempo_evm_respects_gas_cap() {
+        let mut env = evm_env_with_spec(TempoHardfork::T1);
+        env.cfg_env.tx_gas_limit_cap = Some(TIP1000_TX_GAS_LIMIT_CAP);
+
+        let evm = TempoEvm::new(EmptyDB::default(), env);
+
+        // Verify gas limit cap is preserved
+        assert_eq!(
+            evm.ctx().cfg.tx_gas_limit_cap,
+            Some(TIP1000_TX_GAS_LIMIT_CAP),
+            "TempoEvm should preserve the gas limit cap from input"
+        );
+    }
+
+    /// Test that gas params differ between T0 and T1 hardforks.
+    #[test]
+    fn test_tempo_evm_gas_params_differ_t0_vs_t1() {
+        // Create T0 and T1 EVMs
+        let t0_evm = TempoEvm::new(EmptyDB::default(), evm_env_with_spec(TempoHardfork::T0));
+        let t1_evm = TempoEvm::new(EmptyDB::default(), evm_env_with_spec(TempoHardfork::T1));
+
+        // T0 should have default EIP-7702 cost (25,000)
+        // T1 should have reduced cost (12,500)
+        let t0_eip7702_cost = t0_evm
+            .ctx()
+            .cfg
+            .gas_params
+            .tx_eip7702_per_empty_account_cost();
+        let t1_eip7702_cost = t1_evm
+            .ctx()
+            .cfg
+            .gas_params
+            .tx_eip7702_per_empty_account_cost();
+
+        assert_eq!(t0_eip7702_cost, 25_000, "T0 should have default 25,000");
+        assert_eq!(t1_eip7702_cost, 12_500, "T1 should have reduced 12,500");
+        assert_ne!(
+            t0_eip7702_cost, t1_eip7702_cost,
+            "Gas params should differ between T0 and T1"
+        );
+    }
+
+    /// Test that T1 has significantly higher state creation costs.
+    #[test]
+    fn test_tempo_evm_t1_state_creation_costs() {
+        use revm::context_interface::cfg::GasId;
+
+        let evm = TempoEvm::new(EmptyDB::default(), evm_env_with_spec(TempoHardfork::T1));
+        let gas_params = &evm.ctx().cfg.gas_params;
+
+        // Verify TIP-1000 state creation cost increases
+        assert_eq!(
+            gas_params.get(GasId::sstore_set_without_load_cost()),
+            250_000,
+            "T1 SSTORE set cost should be 250,000"
+        );
+        assert_eq!(
+            gas_params.get(GasId::tx_create_cost()),
+            500_000,
+            "T1 TX create cost should be 500,000"
+        );
+        assert_eq!(
+            gas_params.get(GasId::create()),
+            500_000,
+            "T1 CREATE opcode cost should be 500,000"
+        );
+        assert_eq!(
+            gas_params.get(GasId::new_account_cost()),
+            250_000,
+            "T1 new account cost should be 250,000"
+        );
+        assert_eq!(
+            gas_params.get(GasId::code_deposit_cost()),
+            1_000,
+            "T1 code deposit cost should be 1,000 per byte"
+        );
     }
 }

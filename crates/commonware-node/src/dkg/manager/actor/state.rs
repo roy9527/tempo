@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     net::SocketAddr,
-    num::{NonZeroU32, NonZeroUsize},
+    num::{NonZeroU16, NonZeroU32, NonZeroUsize},
 };
 
 use alloy_consensus::BlockHeader as _;
@@ -23,14 +23,14 @@ use commonware_p2p::Address;
 use commonware_parallel::Strategy;
 use commonware_runtime::{Metrics, buffer::PoolRef};
 use commonware_storage::journal::{contiguous, segmented};
-use commonware_utils::{NZU32, NZU64, NZUsize, ordered};
+use commonware_utils::{N3f1, NZU16, NZU32, NZU64, NZUsize, ordered};
 use eyre::{OptionExt, WrapErr as _, bail, eyre};
 use futures::{FutureExt as _, StreamExt as _, future::BoxFuture};
 use tracing::{debug, info, instrument, warn};
 
 use crate::consensus::{Digest, block::Block};
 
-const PAGE_SIZE: NonZeroUsize = NZUsize!(1 << 12);
+const PAGE_SIZE: NonZeroU16 = NZU16!(1 << 12);
 const POOL_CAPACITY: NonZeroUsize = NZUsize!(1 << 20);
 const WRITE_BUFFER: NonZeroUsize = NZUsize!(1 << 12);
 const READ_BUFFER: NonZeroUsize = NZUsize!(1 << 20);
@@ -97,15 +97,6 @@ where
     /// Returns the DKG outcome for the current epoch.
     pub(super) fn current(&self) -> State {
         self.current.clone()
-    }
-
-    /// Returns the DKG outcome for the previous epoch, if there is one.
-    pub(super) async fn previous(&self) -> Option<State> {
-        let previous_epoch = self.current().epoch.previous()?;
-
-        let segment = self.states.size().checked_sub(2)?;
-        let previous = self.states.read(segment).await.ok()?;
-        (previous_epoch == previous.epoch).then_some(previous)
     }
 
     /// Appends the outcome of a DKG ceremony to state
@@ -384,7 +375,7 @@ where
             share
         };
 
-        let (mut dealer, pub_msg, priv_msgs) = dkg::Dealer::start(
+        let (mut dealer, pub_msg, priv_msgs) = dkg::Dealer::start::<N3f1>(
             Transcript::resume(seed).noise(b"dealer-rng"),
             round.info.clone(),
             me.clone(),
@@ -465,10 +456,30 @@ where
             .prune(up_to_epoch.get())
             .await
             .wrap_err("unable to prune events journal")?;
-        self.states
-            .prune(up_to_epoch.get())
-            .await
-            .wrap_err("unable to prune outcomes journal")?;
+
+        // Cannot map epochs directly to segments like in the events journal.
+        // Need to first check what the epoch of the state is and go from there.
+        //
+        // size-2 to ensure that there is always something at the tip.
+        if let Some(previous_segment) = self.states.size().checked_sub(2)
+            && let Ok(previous_state) = self.states.read(previous_segment).await
+        {
+            // NOTE: this does not cover the segment at size-3. In theory it
+            // could be state-3.epoch >= up_to_epoch, but that's ok as long
+            // as state-2 does not get pruned.
+            let to_prune = if previous_state.epoch >= up_to_epoch {
+                previous_segment
+            } else {
+                self.states
+                    .size()
+                    .checked_sub(1)
+                    .expect("there must be at least one segment")
+            };
+            self.states
+                .prune(to_prune)
+                .await
+                .wrap_err("unable to prune state journal")?;
+        }
         self.cache.retain(|&epoch, _| epoch >= up_to_epoch);
         Ok(())
     }
@@ -930,7 +941,7 @@ impl Dealer {
         // Even after the finalized_log is taken, we won't attempt to finalize
         // again because the dealer will be None.
         if let Some(dealer) = self.dealer.take() {
-            let log = dealer.finalize();
+            let log = dealer.finalize::<N3f1>();
             self.finalized = Some(log);
         }
     }
@@ -980,7 +991,7 @@ impl Round {
             epoch: state.epoch,
             dealers: state.dealers.keys().clone(),
             players: state.players.keys().clone(),
-            info: Info::new(
+            info: Info::new::<N3f1>(
                 namespace,
                 state.epoch.get(),
                 previous_output,
@@ -1052,7 +1063,7 @@ impl Player {
         // Otherwise generate a new ack
         let ack = self
             .player
-            .dealer_message(dealer.clone(), pub_msg.clone(), priv_msg.clone())
+            .dealer_message::<N3f1>(dealer.clone(), pub_msg.clone(), priv_msg.clone())
             // FIXME(janis): it would be great to know why exactly that is not the case.
             .ok_or_eyre(
                 "applying dealer message to player instance did not result in a usable ack",
@@ -1077,7 +1088,7 @@ impl Player {
         }
         if let Some(ack) = self
             .player
-            .dealer_message(dealer.clone(), pub_msg, priv_msg)
+            .dealer_message::<N3f1>(dealer.clone(), pub_msg, priv_msg)
         {
             self.acks.insert(dealer, ack);
         }
@@ -1089,7 +1100,7 @@ impl Player {
         logs: BTreeMap<PublicKey, dkg::DealerLog<MinSig, PublicKey>>,
         strategy: &impl Strategy,
     ) -> Result<(Output<MinSig, PublicKey>, Share), dkg::Error> {
-        self.player.finalize(logs, strategy)
+        self.player.finalize::<N3f1>(logs, strategy)
     }
 }
 

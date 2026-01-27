@@ -26,7 +26,7 @@ use commonware_runtime::{
     Clock, Metrics as _, Runner as _,
     deterministic::{self, Context, Runner},
 };
-use commonware_utils::{TryFromIterator as _, ordered};
+use commonware_utils::{N3f1, TryFromIterator as _, ordered};
 use futures::future::join_all;
 use itertools::Itertools as _;
 use reth_node_metrics::recorder::PrometheusRecorder;
@@ -134,7 +134,7 @@ impl Default for Setup {
 ///
 /// The oracle is accessible via `TestingNode::oracle()` if needed for dynamic linking.
 pub async fn setup_validators(
-    mut context: Context,
+    context: &mut Context,
     Setup {
         how_many_signers,
         how_many_verifiers,
@@ -154,12 +154,12 @@ pub async fn setup_validators(
     );
     network.start();
 
-    let mut signer_keys = repeat_with(|| PrivateKey::random(&mut context))
+    let mut signer_keys = repeat_with(|| PrivateKey::random(&mut *context))
         .take(how_many_signers as usize)
         .collect::<Vec<_>>();
     signer_keys.sort_by_key(|key| key.public_key());
-    let (initial_dkg_outcome, shares) = dkg::deal(
-        &mut context,
+    let (initial_dkg_outcome, shares) = dkg::deal::<_, _, N3f1>(
+        &mut *context,
         Mode::NonZeroCounter,
         ordered::Set::try_from_iter(signer_keys.iter().map(|key| key.public_key())).unwrap(),
     )
@@ -171,21 +171,30 @@ pub async fn setup_validators(
         next_players: shares.keys().clone(),
         is_next_full_dkg: false,
     };
-    let mut verifier_keys = repeat_with(|| PrivateKey::random(&mut context))
+    let mut verifier_keys = repeat_with(|| PrivateKey::random(&mut *context))
         .take(how_many_verifiers as usize)
         .collect::<Vec<_>>();
     verifier_keys.sort_by_key(|key| key.public_key());
 
     // The port here does not matter because it will be ignored in simulated p2p.
     // Still nice, because sometimes nodes can be better identified in logs.
-    let validators =
-        ordered::Map::try_from_iter(shares.keys().iter().enumerate().map(|(i, key)| {
-            (
-                key.clone(),
-                SocketAddr::from(([127, 0, 0, 1], i as u16 + 1)),
-            )
-        }))
-        .unwrap();
+    let network_addresses = (1..)
+        .map(|port| SocketAddr::from(([127, 0, 0, 1], port)))
+        .take((how_many_signers + how_many_verifiers) as usize)
+        .collect::<Vec<_>>();
+    let chain_addresses = (0..)
+        .map(crate::execution_runtime::validator)
+        .take((how_many_signers + how_many_verifiers) as usize)
+        .collect::<Vec<_>>();
+
+    let validators = ordered::Map::try_from_iter(
+        shares
+            .iter()
+            .zip(&network_addresses)
+            .zip(&chain_addresses)
+            .map(|((key, net_addr), chain_addr)| (key.clone(), (*net_addr, *chain_addr))),
+    )
+    .unwrap();
 
     let execution_runtime = ExecutionRuntime::builder()
         .with_epoch_length(epoch_length)
@@ -200,15 +209,18 @@ pub async fn setup_validators(
         .generate();
 
     let mut nodes = vec![];
-    for ((private_key, share), mut execution_config) in signer_keys
-        .into_iter()
-        .zip_eq(shares)
-        .map(|(signing_key, (verifying_key, share))| {
-            assert_eq!(signing_key.public_key(), verifying_key);
-            (signing_key, Some(share))
-        })
-        .chain(verifier_keys.into_iter().map(|key| (key, None)))
-        .zip_eq(execution_configs)
+    for ((((private_key, share), mut execution_config), network_address), chain_address) in
+        signer_keys
+            .into_iter()
+            .zip_eq(shares)
+            .map(|(signing_key, (verifying_key, share))| {
+                assert_eq!(signing_key.public_key(), verifying_key);
+                (signing_key, Some(share))
+            })
+            .chain(verifier_keys.into_iter().map(|key| (key, None)))
+            .zip_eq(execution_configs)
+            .zip_eq(network_addresses)
+            .zip_eq(chain_addresses)
     {
         let oracle = oracle.clone();
         let uid = format!("{CONSENSUS_NODE_PREFIX}_{}", private_key.public_key());
@@ -225,7 +237,6 @@ pub async fn setup_validators(
         execution_config.feed_state = Some(feed_state.clone());
 
         let engine_config = consensus::Builder {
-            context: context.with_label(&uid),
             fee_recipient: alloy_primitives::Address::ZERO,
             execution_node: None,
             blocker: oracle.control(private_key.public_key()),
@@ -244,6 +255,7 @@ pub async fn setup_validators(
             new_payload_wait_time: Duration::from_millis(200),
             time_to_build_subblock: Duration::from_millis(100),
             subblock_broadcast_interval: Duration::from_millis(50),
+            fcu_heartbeat_interval: Duration::from_secs(300),
             feed_state,
         };
 
@@ -254,6 +266,8 @@ pub async fn setup_validators(
             engine_config,
             execution_runtime.handle(),
             execution_config,
+            network_address,
+            chain_address,
         ));
     }
 
@@ -267,11 +281,11 @@ pub fn run(setup: Setup, mut stop_condition: impl FnMut(&str, &str) -> bool) -> 
     let cfg = deterministic::Config::default().with_seed(setup.seed);
     let executor = Runner::from(cfg);
 
-    executor.start(|context| async move {
+    executor.start(|mut context| async move {
         // Setup and run all validators.
-        let (mut nodes, _execution_runtime) = setup_validators(context.clone(), setup).await;
+        let (mut nodes, _execution_runtime) = setup_validators(&mut context, setup).await;
 
-        join_all(nodes.iter_mut().map(|node| node.start())).await;
+        join_all(nodes.iter_mut().map(|node| node.start(&context))).await;
 
         loop {
             let metrics = context.encode();
